@@ -47,6 +47,13 @@ describe.skipIf(!URL_)("in-process LDAP against a real server", () => {
     expect(await handleAuthenticate({ username: "nomail", password: "NoMail-Pass-1", config: cfg() })).toMatchObject({ reason: "missing_email" })
   })
 
+  it("signs in an AD account that has no mail through its userPrincipalName", async () => {
+    expect(await handleAuthenticate({ username: "upnonly", password: "Upn-Pass-1", config: cfg() })).toMatchObject({
+      success: true,
+      user: { email: "upnonly@Corp.Example", name: "Upn Only", groups: [ADMINS] },
+    })
+  })
+
   it("runs the connection test", async () => {
     const ok = await handleTest(cfg())
     expect(ok.success).toBe(true)

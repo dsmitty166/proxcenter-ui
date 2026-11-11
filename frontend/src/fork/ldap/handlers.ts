@@ -34,6 +34,12 @@ import {
 /** Upstream compares the error text to this exact string (src/lib/auth/ldap.ts). */
 export const INVALID_CREDENTIALS = "Invalid credentials"
 
+/** Why an entry cannot sign in for lack of an e-mail, for the log and the diagnostic. */
+function missingEmailMessage(cfg: DirectoryConfig): string {
+  const attr = (cfg.email_attribute || "").trim() || "mail"
+  return `the entry has no "${attr}" attribute and no userPrincipalName: ProxCenter identifies accounts by e-mail, so sign-in is refused`
+}
+
 function message(err: unknown): string {
   const e = err as { message?: string } | null
   return (e?.message || String(err)).slice(0, 300)
@@ -98,7 +104,7 @@ export async function handleAuthenticate(body: AuthenticateBody): Promise<Authen
     // Upstream keys accounts by e-mail: an entry without one would collide
     // with every other such entry on the empty string.
     if (!user.email) {
-      return { success: false, error: `The entry has no "${cfg.email_attribute || "mail"}" attribute`, reason: "missing_email" }
+      return { success: false, error: missingEmailMessage(cfg), reason: "missing_email" }
     }
 
     try {
@@ -298,7 +304,11 @@ export async function handleLookup(body: LookupBody): Promise<LdapLookupResult> 
 
     if (found.entries.length === 1) {
       const user = toLookupUser(found.entries[0], cfg)
-      return { ...result, status: "found", user, filter_groups: filterGroupChecks(cfg.user_filter || "", user), nested_groups: [] }
+      const filter_groups = filterGroupChecks(cfg.user_filter || "", user)
+      // Sign-in refuses an entry without an e-mail: say so here, rather than
+      // "can sign in". The entry, its groups and its role are still reported.
+      if (!user.email) return { ...result, status: "error", stage: "search", error: missingEmailMessage(cfg), user, filter_groups, nested_groups: [] }
+      return { ...result, status: "found", user, filter_groups, nested_groups: [] }
     }
 
     // Not found: is the user there at all, and excluded by the other clauses?

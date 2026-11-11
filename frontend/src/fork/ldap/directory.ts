@@ -103,8 +103,12 @@ export async function serviceBind(client: Client, cfg: DirectoryConfig): Promise
   await client.bind(dn, cfg.bind_password || "")
 }
 
+/** Read whenever the configured e-mail attribute is empty (see entryEmail). */
+export const EMAIL_FALLBACK_ATTRIBUTE = "userPrincipalName"
+
 function attributeNames(cfg: DirectoryConfig): string[] {
-  return [emailAttribute(cfg), nameAttribute(cfg), groupAttribute(cfg)]
+  const names = [emailAttribute(cfg), nameAttribute(cfg), groupAttribute(cfg), EMAIL_FALLBACK_ATTRIBUTE]
+  return names.filter((n, i) => names.findIndex(m => m.toLowerCase() === n.toLowerCase()) === i)
 }
 
 export function emailAttribute(cfg: DirectoryConfig): string {
@@ -156,8 +160,22 @@ export function attributeValues(entry: Entry, name: string): string[] {
     .filter(Boolean)
 }
 
+/**
+ * The e-mail that identifies the account: upstream keys accounts by e-mail,
+ * so an entry without one cannot sign in. Active Directory accounts often
+ * have no `mail` but always a userPrincipalName (user@domain), unique in the
+ * forest. It is used when the configured attribute is empty, which matches
+ * the e-mails existing Enterprise installs hold for such accounts.
+ */
+export function entryEmail(entry: Entry, cfg: DirectoryConfig): string {
+  const configured = attributeValues(entry, emailAttribute(cfg))[0]
+  if (configured) return configured
+  const upn = attributeValues(entry, EMAIL_FALLBACK_ATTRIBUTE)[0]
+  return upn && upn.includes("@") ? upn : ""
+}
+
 export function entryToUser(entry: Entry, cfg: DirectoryConfig): DirectoryUser {
-  const email = attributeValues(entry, emailAttribute(cfg))[0] || ""
+  const email = entryEmail(entry, cfg)
   const name = attributeValues(entry, nameAttribute(cfg))[0] || ""
   return {
     dn: entry.dn,

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest"
 
-import { attributeValues, buildUserFilter, createClient, entryToUser, identityFilter, isConnectionError } from "./directory"
+import { attributeValues, buildUserFilter, createClient, entryEmail, entryToUser, identityFilter, isConnectionError } from "./directory"
 
 describe("buildUserFilter", () => {
   it("substitutes every placeholder, escaped", () => {
@@ -40,6 +40,18 @@ describe("entries", () => {
   it("falls back to the e-mail, then the DN, for the display name", () => {
     expect(entryToUser({ dn: "CN=x", mail: "x@y" } as any, { url: "" }).name).toBe("x@y")
     expect(entryToUser({ dn: "CN=x" } as any, { url: "" }).name).toBe("CN=x")
+  })
+})
+
+describe("entryEmail", () => {
+  const cfg = { url: "", email_attribute: "mail" }
+  it("prefers the configured attribute, then the userPrincipalName", () => {
+    expect(entryEmail({ dn: "x", mail: "a@b", userPrincipalName: "u@b" } as any, cfg)).toBe("a@b")
+    expect(entryEmail({ dn: "x", userPrincipalName: "u@b" } as any, cfg)).toBe("u@b")
+  })
+  it("ignores a userPrincipalName that is not user@domain", () => {
+    expect(entryEmail({ dn: "x", userPrincipalName: "justname" } as any, cfg)).toBe("")
+    expect(entryEmail({ dn: "x" } as any, cfg)).toBe("")
   })
 })
 

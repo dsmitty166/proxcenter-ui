@@ -22,7 +22,7 @@ Features are switched on with the `PROXCENTER_FORK_FEATURES` environment variabl
 - The username is escaped into the filter (RFC 4515): `*`, `(`, `)`, `\` cannot change the filter.
 - An empty password is refused without contacting the directory (an empty simple bind is an *unauthenticated* bind that many directories accept).
 - More than one matching entry is refused, never "first one wins". A filter matching a whole subtree costs one entry over the limit, not a full read.
-- An entry without the e-mail attribute is refused: upstream keys accounts by e-mail.
+- Accounts are keyed by e-mail upstream. The e-mail is the configured attribute (`mail`), or else the `userPrincipalName` (Active Directory accounts often have no `mail`; existing Enterprise installs hold the UPN for them). An entry with neither is refused, and the user-lookup diagnostic says so.
 - `ldaps://` uses TLS with the system store plus the optional CA certificate from the form; "Ignore TLS certificate errors" turns verification off. `ldap://` is plain LDAP (no StartTLS). Use `ldaps://` in production.
 
 ## Running it

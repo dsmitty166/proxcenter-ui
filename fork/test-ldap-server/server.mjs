@@ -9,7 +9,8 @@
 //   jadmin    / Admin-Pass-1  / VIRT-Admins, VIRT-Users
 //   ooperator / Oper-Pass-1   / VIRT-Users
 //   rreader   / Read-Pass-1   / Read Only
-//   nomail    / NoMail-Pass-1 / (no mail attribute)
+//   nomail    / NoMail-Pass-1 / (neither mail nor userPrincipalName)
+//   upnonly   / Upn-Pass-1    / VIRT-Admins (no mail, userPrincipalName only: typical AD)
 //   dup       / x             / two entries share this name
 import ldap from "ldapjs"
 
@@ -29,10 +30,11 @@ const entries = [
   { dn: "OU=Groups,DC=corp,DC=example", attrs: { objectClass: "organizationalUnit", ou: "Groups" } },
   { dn: "OU=Service,DC=corp,DC=example", attrs: { objectClass: "organizationalUnit", ou: "Service" } },
   { dn: "CN=svc-proxcenter,OU=Service,DC=corp,DC=example", password: "svc-secret", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "svc-proxcenter" } },
-  { dn: "CN=Jane Admin,OU=Users,DC=corp,DC=example", password: "Admin-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "jadmin", mail: "jane.admin@corp.example", displayName: "Jane Admin", memberOf: [G.admins, G.users] } },
+  { dn: "CN=Jane Admin,OU=Users,DC=corp,DC=example", password: "Admin-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "jadmin", mail: "jane.admin@corp.example", userPrincipalName: "jadmin@corp.example", displayName: "Jane Admin", memberOf: [G.admins, G.users] } },
   { dn: "CN=Owen Operator,OU=Users,DC=corp,DC=example", password: "Oper-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "ooperator", mail: "owen.operator@corp.example", displayName: "Owen Operator", memberOf: [G.users] } },
   { dn: "CN=Rita Reader,OU=Users,DC=corp,DC=example", password: "Read-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "rreader", mail: "rita.reader@corp.example", displayName: "Rita Reader", memberOf: [G.readonly] } },
   { dn: "CN=No Mail,OU=Users,DC=corp,DC=example", password: "NoMail-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "nomail", displayName: "No Mail" } },
+  { dn: "CN=Upn Only,OU=Users,DC=corp,DC=example", password: "Upn-Pass-1", attrs: { objectClass: ["top", "person", "user"], sAMAccountName: "upnonly", userPrincipalName: "upnonly@Corp.Example", displayName: "Upn Only", memberOf: [G.admins] } },
   { dn: "CN=Dup One,OU=Users,DC=corp,DC=example", password: "x", attrs: { objectClass: "user", sAMAccountName: "dup", mail: "dup1@corp.example" } },
   { dn: "CN=Dup Two,OU=Users,DC=corp,DC=example", password: "x", attrs: { objectClass: "user", sAMAccountName: "dup", mail: "dup2@corp.example" } },
   { dn: G.admins, attrs: { objectClass: "group", cn: "VIRT-Admins" } },
