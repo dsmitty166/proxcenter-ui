@@ -44,7 +44,9 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          # The token is not stored in .git/config: only the two pushes below
+          # receive it, through a one-off header (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Fetch upstream
         run: |
@@ -54,7 +56,12 @@ jobs:
 
       - name: Mirror upstream main into the upstream branch
         continue-on-error: true # needs the Workflows permission when upstream changed a workflow
-        run: git push --force origin refs/remotes/upstream/main:refs/heads/upstream
+        env:
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=$auth" push --force origin refs/remotes/upstream/main:refs/heads/upstream
 
       - name: Pick the release to merge
         id: pick
@@ -76,7 +83,7 @@ jobs:
         if: steps.pick.outputs.already != 'true'
         env:
           TAG: ${{ steps.pick.outputs.tag }}
-          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
         run: |
           branch="sync/upstream-$TAG"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
@@ -88,7 +95,9 @@ jobs:
           git switch -c "$branch"
           if git merge --no-ff --no-edit -m "Merge upstream $TAG" "refs/tags/$TAG"; then
             echo "conflict=false" >> "$GITHUB_OUTPUT"
-            git push origin "$branch"
+            auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+            echo "::add-mask::$auth"
+            git -c "http.https://github.com/.extraheader=$auth" push origin "$branch"
           else
             echo "conflict=true" >> "$GITHUB_OUTPUT"
             git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"

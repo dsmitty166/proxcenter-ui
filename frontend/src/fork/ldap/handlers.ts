@@ -224,7 +224,17 @@ function toLookupUser(entry: Parameters<typeof entryToUser>[0], cfg: DirectoryCo
   return { dn: u.dn, email: u.email, name: u.name, groups: u.groups }
 }
 
-const normDn = (dn: string) => dn.trim().toLowerCase().replace(/\s*,\s*/g, ",")
+/**
+ * DN comparison key: lower-cased, no spaces around the RDN separators.
+ * Split and trim rather than /\s*,\s*\/: group DNs come from the directory
+ * and the filter, and that regex backtracks quadratically on long runs of spaces.
+ */
+export const normDn = (dn: string) =>
+  dn
+    .split(",")
+    .map(part => part.trim())
+    .join(",")
+    .toLowerCase()
 
 /** `(memberOf=...)` clauses of the user filter, checked against the subject's direct groups. */
 function filterGroupChecks(template: string, subject: LookupUser | null): FilterGroupCheck[] {

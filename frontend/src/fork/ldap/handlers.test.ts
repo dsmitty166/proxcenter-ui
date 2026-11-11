@@ -6,7 +6,7 @@ vi.mock("ldapts", async orig => ({
   Client: function (opts: any) { return new (globalThis as any).__forkFakeLdapClient(opts) },
 }))
 
-import { handleAuthenticate, handleLookup, handleTest, INVALID_CREDENTIALS } from "./handlers"
+import { handleAuthenticate, handleLookup, handleTest, INVALID_CREDENTIALS, normDn } from "./handlers"
 import { adConfig, fakeLog, resetFakeLog, GROUP_ADMINS, GROUP_USERS, SVC_DN } from "./testing/fakeDirectory"
 
 beforeEach(() => resetFakeLog())
@@ -135,6 +135,25 @@ describe("handleTest", () => {
     const res = await handleTest(adConfig({ user_filter: "(objectClass=user)" }))
     expect(res.success).toBe(true)
     expect(res.checks.find(c => c.id === "user_filter")?.status).toBe("warning")
+  })
+})
+
+describe("normDn", () => {
+  it("ignores case and spaces around the separators", () => {
+    expect(normDn(" CN=Read Only , OU=Groups,DC=corp ,DC=example ")).toBe("cn=read only,ou=groups,dc=corp,dc=example")
+  })
+  it("stays linear on long runs of spaces (CodeQL js/polynomial-redos)", () => {
+    const hostile = "CN=x" + " ".repeat(200_000) + "y"
+    const t = performance.now()
+    expect(normDn(hostile)).toBe(hostile.toLowerCase())
+    expect(performance.now() - t).toBeLessThan(200)
+  })
+  it("matches a filter clause written with spaces after the commas", async () => {
+    // The diagnostic reports jadmin as a direct member of the clause's group,
+    // although the clause spells the DN with spaces and the directory without.
+    const cfg = adConfig({ user_filter: "(&(sAMAccountName={{username}})(memberOf=CN=VIRT-Admins, OU=Groups, DC=corp, DC=example))" })
+    const res = await handleLookup({ username: "jadmin", config: cfg })
+    expect(res.filter_groups?.[0]).toMatchObject({ evaluated: true, direct: true })
   })
 })
 
