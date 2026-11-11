@@ -22,7 +22,7 @@ export const ENTRIES: FakeEntry[] = [
   {
     dn: "CN=Jane Admin,OU=Users,DC=corp,DC=example",
     password: "Admin-Pass-1",
-    attrs: { objectClass: ["top", "user"], sAMAccountName: "jadmin", mail: "Jane.Admin@corp.example", displayName: "Jane Admin", memberOf: [GROUP_ADMINS, GROUP_USERS] },
+    attrs: { objectClass: ["top", "user"], sAMAccountName: "jadmin", mail: "Jane.Admin@corp.example", userPrincipalName: "jadmin@corp.example", displayName: "Jane Admin", memberOf: [GROUP_ADMINS, GROUP_USERS] },
   },
   {
     dn: "CN=Owen Operator,OU=Users,DC=corp,DC=example",
@@ -38,6 +38,12 @@ export const ENTRIES: FakeEntry[] = [
     dn: "CN=No Mail,OU=Users,DC=corp,DC=example",
     password: "NoMail-Pass-1",
     attrs: { objectClass: ["top", "user"], sAMAccountName: "nomail", displayName: "No Mail" },
+  },
+  {
+    // Typical AD account: no mail, a userPrincipalName.
+    dn: "CN=Upn Only,OU=Users,DC=corp,DC=example",
+    password: "Upn-Pass-1",
+    attrs: { objectClass: ["top", "user"], sAMAccountName: "upnonly", userPrincipalName: "upnonly@Corp.Example", displayName: "Upn Only", memberOf: [GROUP_ADMINS] },
   },
   { dn: "CN=Dup One,OU=Users,DC=corp,DC=example", password: "x", attrs: { objectClass: "user", sAMAccountName: "dup", mail: "dup1@corp.example" } },
   { dn: "CN=Dup Two,OU=Users,DC=corp,DC=example", password: "x", attrs: { objectClass: "user", sAMAccountName: "dup", mail: "dup2@corp.example" } },

@@ -73,6 +73,14 @@ describe("sign-in: upstream authenticateLdapDetailed via the fork", () => {
     expect(orchestratorFetch).not.toHaveBeenCalled()
   })
 
+  it("signs in an AD account without mail under its userPrincipalName", async () => {
+    const { authenticateLdapDetailed } = await import("@/lib/auth/ldap")
+    const out = await authenticateLdapDetailed("upnonly", "Upn-Pass-1")
+    expect(out.failure).toBeNull()
+    // Upstream lower-cases it into the account key: upnonly@corp.example.
+    expect(out.user?.email.toLowerCase()).toBe("upnonly@corp.example")
+  })
+
   it("maps a wrong password to invalid_password (counts against the account)", async () => {
     const { authenticateLdapDetailed } = await import("@/lib/auth/ldap")
     expect(await authenticateLdapDetailed("jadmin", "bad")).toMatchObject({ user: null, failure: "invalid_password" })
@@ -107,6 +115,14 @@ describe("settings: upstream test and diagnose routes via the fork", () => {
     expect(body.success).toBe(true)
     expect(body.checks.map((x: any) => x.id)).toEqual(["connect", "bind", "base_dn", "user_filter", "user_lookup", "user_password", "group_membership", "role_mapping"])
     expect(orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  it("user lookup diagnostic refuses an entry without any e-mail, still showing it", async () => {
+    const { POST } = await import("@/app/api/v1/auth/ldap/diagnose/route")
+    const res = await callRoute(POST as any, { body: { ...adConfig(), test_username: "nomail" } })
+    const body = await readJson<any>(res)
+    expect(body.data.evaluation.blocker).toBe("lookup_error")
+    expect(body.data.lookup).toMatchObject({ status: "error", stage: "search", user: { dn: "CN=No Mail,OU=Users,DC=corp,DC=example" } })
   })
 
   it("user lookup diagnostic evaluates allowed groups and role mapping", async () => {

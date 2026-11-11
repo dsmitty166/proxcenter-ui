@@ -138,6 +138,32 @@ describe("handleTest", () => {
   })
 })
 
+describe("e-mail of the account (AD without mail)", () => {
+  it("falls back to the userPrincipalName when the entry has no mail", async () => {
+    const res = await handleAuthenticate({ username: "upnonly", password: "Upn-Pass-1", config: adConfig() })
+    expect(res).toMatchObject({ success: true, user: { email: "upnonly@Corp.Example", name: "Upn Only", groups: [GROUP_ADMINS] } })
+  })
+  it("keeps the configured attribute when the entry has one", async () => {
+    const res = await handleAuthenticate({ username: "jadmin", password: "Admin-Pass-1", config: adConfig() })
+    expect(res).toMatchObject({ success: true, user: { email: "Jane.Admin@corp.example" } })
+  })
+  it("uses the userPrincipalName when it is the configured attribute", async () => {
+    const res = await handleAuthenticate({ username: "jadmin", password: "Admin-Pass-1", config: adConfig({ email_attribute: "userPrincipalName" }) })
+    expect(res).toMatchObject({ success: true, user: { email: "jadmin@corp.example" } })
+  })
+  it("still refuses an entry with neither, and says why", async () => {
+    const res = await handleAuthenticate({ username: "nomail", password: "NoMail-Pass-1", config: adConfig() })
+    expect(res).toMatchObject({ success: false, reason: "missing_email" })
+    expect(res.success === false && res.error).toMatch(/no "mail" attribute and no userPrincipalName/)
+  })
+  it("the lookup diagnostic flags such an entry instead of answering 'can sign in'", async () => {
+    const res = await handleLookup({ username: "nomail", config: adConfig() })
+    expect(res).toMatchObject({ status: "error", stage: "search", match_count: 1, user: { dn: "CN=No Mail,OU=Users,DC=corp,DC=example" } })
+    expect(res.error).toMatch(/sign-in is refused/)
+    expect(await handleLookup({ username: "upnonly", config: adConfig() })).toMatchObject({ status: "found", user: { email: "upnonly@Corp.Example" } })
+  })
+})
+
 describe("normDn", () => {
   it("ignores case and spaces around the separators", () => {
     expect(normDn(" CN=Read Only , OU=Groups,DC=corp ,DC=example ")).toBe("cn=read only,ou=groups,dc=corp,dc=example")
