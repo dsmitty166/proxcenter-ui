@@ -37,7 +37,8 @@ env:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    # Repo variable FORK_RUNS_ON picks the runner (JSON label or list, e.g. ["self-hosted","linux"]).
+    runs-on: ${{ fromJSON(vars.FORK_RUNS_ON || '"ubuntu-latest"') }}
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

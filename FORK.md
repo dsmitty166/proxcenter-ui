@@ -98,6 +98,10 @@ FORK_LDAP_TEST_URL=ldap://127.0.0.1:10389 npx vitest run -c vitest.fork.config.m
 
 Upstream's full suite (`npx vitest run`, needs Postgres), ESLint and the strict type check run unchanged in upstream's own workflows on every PR.
 
+### Runners
+
+The fork workflows run on `ubuntu-latest` unless the repository variable `FORK_RUNS_ON` says otherwise. It takes a JSON label or list, e.g. `"self-hosted"` or `["self-hosted","linux"]`. Use it where GitHub-hosted runners are disabled by policy, as in an Enterprise Managed Users account. The runner needs `git`, outbound HTTPS to github.com (for upstream and for actions), and Docker for `fork-image.yml`.
+
 ### Upstream workflows in this fork
 
 Upstream's `docker-publish.yml`, `sonarcloud.yml` and `security-scan.yml` also run here. Their test and lint jobs work; their publish, SonarCloud and orchestrator jobs need upstream's secrets and fail or skip. Disable the ones you do not want from the Actions tab (`gh workflow disable <name>`), which changes no file and so never conflicts.

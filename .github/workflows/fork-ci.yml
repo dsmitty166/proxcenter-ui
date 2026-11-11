@@ -21,7 +21,8 @@ permissions:
 
 jobs:
   fork-tests:
-    runs-on: ubuntu-latest
+    # Repo variable FORK_RUNS_ON picks the runner (JSON label or list, e.g. ["self-hosted","linux"]).
+    runs-on: ${{ fromJSON(vars.FORK_RUNS_ON || '"ubuntu-latest"') }}
     defaults:
       run:
         working-directory: ./frontend
