@@ -9,8 +9,12 @@
 
 services:
   frontend:
-    # The fork's image, built by .github/workflows/fork-image.yml.
-    image: ${FORK_REGISTRY:-ghcr.io/dsmitty166}/proxcenter-frontend-fork:${FORK_VERSION:-main}
+    # The fork's image, built by .github/workflows/fork-image.yml into the
+    # GitHub Container Registry of the repository that runs it:
+    #   ghcr.io/<repository owner, lower-case>/proxcenter-frontend-fork:<tag>
+    # Set FORK_IMAGE in .env. A private package needs `docker login ghcr.io`
+    # on the host first (a token with read:packages).
+    image: ${FORK_IMAGE:?Set FORK_IMAGE in .env, e.g. ghcr.io/<owner>/proxcenter-frontend-fork:main}
     environment:
       # Enterprise-gated features this fork switches on. Supported:
       # ldap, rbac, oidc, syslog_forwarding, compliance (see FORK.md).

@@ -1,6 +1,6 @@
 # ProxCenter Community fork
 
-This repository is a fork of [adminsyspro/proxcenter-ui](https://github.com/adminsyspro/proxcenter-ui), the AGPL-3.0 Community Edition of ProxCenter. It adds a few features that upstream reserves for the Enterprise Edition, re-implemented here as open code.
+This repository is derived from [adminsyspro/proxcenter-ui](https://github.com/adminsyspro/proxcenter-ui), the AGPL-3.0 Community Edition of ProxCenter. It adds a few features that upstream reserves for the Enterprise Edition, re-implemented here as open code. It does not need to be a GitHub "fork": it shares upstream's git history and pulls from upstream's URL, so it works the same in a plain private or internal repository.
 
 It is built so that **upstream releases merge in cleanly**: the fork's code lives in its own files, and upstream files carry only a handful of one-line hooks, each marked `// FORK:`.
 
@@ -32,7 +32,7 @@ Features are switched on with the `PROXCENTER_FORK_FEATURES` environment variabl
 docker compose -f docker-compose.community.yml -f docker-compose.fork.yml up -d
 ```
 
-`docker-compose.fork.yml` swaps in the fork's image (`ghcr.io/dsmitty166/proxcenter-frontend-fork`, built by `fork-image.yml`) and sets `PROXCENTER_FORK_FEATURES` (default `ldap,rbac,syslog_forwarding,compliance`; add `oidc` if you use it).
+`docker-compose.fork.yml` swaps in the fork's image, built by `fork-image.yml` into this repository's GitHub Container Registry. Set `FORK_IMAGE` in `.env` (e.g. `ghcr.io/<owner, lower-case>/proxcenter-frontend-fork:main`; a private package needs `docker login ghcr.io` with a `read:packages` token on the host). It also sets `PROXCENTER_FORK_FEATURES` (default `ldap,rbac,syslog_forwarding,compliance`; add `oidc` if you use it).
 
 ## Hooks in upstream files
 

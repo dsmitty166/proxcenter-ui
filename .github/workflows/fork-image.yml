@@ -1,5 +1,5 @@
 # FORK: builds the fork's frontend image and publishes it to this repository's
-# GitHub Container Registry as ghcr.io/<owner>/proxcenter-frontend-fork.
+# GitHub Container Registry as ghcr.io/<owner, lower-case>/proxcenter-frontend-fork.
 # (Upstream's docker-publish.yml cannot publish from the fork: its build waits
 # on a job that needs upstream's private orchestrator token.)
 #
@@ -52,11 +52,16 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/fork-v* ]]; then v="${GITHUB_REF#refs/tags/fork-v}"; else v="${base#v}-fork.${GITHUB_SHA::7}"; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
+      - name: Image name
+        id: img
+        # Registry paths must be lower-case; owners such as Name_Org are not.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/proxcenter-frontend-fork" >> "$GITHUB_OUTPUT"
+
       - name: Image metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/proxcenter-frontend-fork
+          images: ${{ steps.img.outputs.name }}
           tags: |
             type=ref,event=branch
             type=sha
