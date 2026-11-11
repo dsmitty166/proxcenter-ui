@@ -3,6 +3,8 @@
 // ids, edition mappings and the effective-feature computation (edition
 // features + option capabilities union).
 
+import { forkGrants } from '@/fork/features' // FORK: see FORK.md
+
 export const Features = {
   DRS: 'drs',
   FIREWALL: 'firewall',
@@ -153,6 +155,7 @@ export function effectiveHasFeature(
   status: LicenseStatusLike | null | undefined,
   id: string,
 ): boolean {
+  if (forkGrants(status as any, id)) return true // FORK: features this fork switches on
   if (!status || status.licensed !== true || status.expired === true) return false
   const editionFeatures = EDITION_FEATURES[status.edition || '']
   if (editionFeatures?.includes(id as FeatureId)) return true

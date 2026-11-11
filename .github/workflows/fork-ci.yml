@@ -1,0 +1,66 @@
+# FORK: checks specific to this fork. Upstream's own workflows (lint.yml, the
+# `test` job of docker-publish.yml) keep running on pull requests and already
+# cover the full Vitest suite with Postgres, ESLint and the strict type check.
+# This one adds what they cannot: the fork hooks contract, and the in-process
+# LDAP code against a real LDAP server over TCP.
+name: Fork CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-ci-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fork-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Generate Prisma client
+        env:
+          DATABASE_URL: postgresql://user:pass@localhost:5432/db
+        run: npx prisma generate
+
+      - name: Start the test LDAP directory
+        working-directory: ./fork/test-ldap-server
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          nohup node server.mjs > "$RUNNER_TEMP/ldap.log" 2>&1 &
+          for i in $(seq 1 30); do
+            grep -q listening "$RUNNER_TEMP/ldap.log" && exit 0
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/ldap.log"; exit 1
+
+      - name: Fork tests, hook contract and upstream tests of hooked files
+        env:
+          FORK_LDAP_TEST_URL: ldap://127.0.0.1:10389
+        run: npx vitest run -c vitest.fork.config.mts
+
+      - name: Test directory log
+        if: always()
+        run: cat "$RUNNER_TEMP/ldap.log" || true

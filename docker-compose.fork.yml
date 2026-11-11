@@ -1,0 +1,18 @@
+# ============================================
+# FORK: overlay on top of upstream's Community compose.
+#
+#   docker compose -f docker-compose.community.yml -f docker-compose.fork.yml up -d
+#
+# Everything else (Postgres, volumes, ports, secrets in .env) comes from
+# upstream's file, so its changes keep flowing in on every merge.
+# ============================================
+
+services:
+  frontend:
+    # The fork's image, built by .github/workflows/fork-image.yml.
+    image: ${FORK_REGISTRY:-ghcr.io/dsmitty166}/proxcenter-frontend-fork:${FORK_VERSION:-main}
+    environment:
+      # Enterprise-gated features this fork switches on. Supported:
+      # ldap, rbac, oidc, syslog_forwarding, compliance (see FORK.md).
+      # Anything else is ignored. Empty = plain upstream Community.
+      - PROXCENTER_FORK_FEATURES=${PROXCENTER_FORK_FEATURES:-ldap,rbac,syslog_forwarding,compliance}

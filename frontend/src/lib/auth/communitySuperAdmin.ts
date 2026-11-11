@@ -27,6 +27,7 @@ import { prisma } from "@/lib/db/prisma"
 import { DEFAULT_TENANT_ID } from "@/lib/tenant/constants"
 
 import type { ServerLicense } from "./requireEnterprise"
+import { forkGrants } from "@/fork/features" // FORK: see FORK.md
 
 export const SUPER_ADMIN_ROLE_ID = "role_super_admin"
 
@@ -47,6 +48,8 @@ export function isOrchestratorConfigured(): boolean {
  * refused, as is an expired Enterprise licence (edition stays "enterprise").
  */
 export function isCommunityDeployment(license: ServerLicense): boolean {
+  // FORK: with RBAC switched on, roles are assigned like on Enterprise; no blanket super-admin.
+  if (forkGrants(null, "rbac")) return false
   if (license.edition !== "community") return false
 
   return license.resolved === true || !isOrchestratorConfigured()
