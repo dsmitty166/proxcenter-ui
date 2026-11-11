@@ -7,6 +7,7 @@ import { prisma } from "@/lib/db/prisma"
 import { decryptSecret } from "@/lib/crypto/secret"
 import { syncProviderRoleAssignment, type ProviderSyncDb } from "./roleSync"
 import { normalizeGroupRoleEntries, type GroupRoleEntry } from "./groupMapping"
+import { forkLdapFetch } from "@/fork/ldap/fetch" // FORK: see FORK.md
 
 export interface LdapUser {
   dn: string
@@ -164,7 +165,7 @@ export async function authenticateLdapDetailed(
       headers["X-API-Key"] = ORCHESTRATOR_API_KEY
     }
 
-    const res = await fetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/authenticate`, {
+    const res = await forkLdapFetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/authenticate`, {
       method: "POST",
       headers,
       body: JSON.stringify({

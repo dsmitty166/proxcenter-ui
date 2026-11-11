@@ -6,6 +6,7 @@ import { NextResponse } from 'next/server'
 import { getConnectionById } from '@/lib/connections/getConnection'
 import { checkPermission, PERMISSIONS } from '@/lib/rbac'
 import { requireEnterprise } from '@/lib/auth/requireEnterprise'
+import { forkGrants } from '@/fork/features' // FORK: see FORK.md
 import { verifyConnectionOwnership, getSessionPrisma } from '@/lib/tenant'
 import { collectHardeningData } from '@/lib/compliance/collectHardeningData'
 import { runAllChecks } from '@/lib/compliance/hardening'
@@ -25,7 +26,7 @@ export async function GET(req: Request) {
     }
 
     // Guard 1: Enterprise-only feature
-    const entGuard = await requireEnterprise()
+    const entGuard = forkGrants(null, 'compliance') ? null : await requireEnterprise() // FORK
     if (entGuard) return entGuard
 
     // Guard 2: Tenant ownership (matches hardening route pattern)

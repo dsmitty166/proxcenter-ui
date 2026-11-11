@@ -1,0 +1,12 @@
+{
+  "name": "proxcenter-fork-test-ldap-server",
+  "private": true,
+  "description": "FORK: AD-shaped test directory for the in-process LDAP integration tests and local demos. Test-only, never shipped.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "ldapjs": "3.0.7"
+  }
+}

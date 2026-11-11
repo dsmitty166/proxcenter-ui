@@ -7,6 +7,7 @@ import { prisma } from "@/lib/db/prisma"
 import { bindPasswordOrSaved } from "@/lib/auth/ldap"
 import { normalizeGroupRoleEntries } from "@/lib/auth/groupMapping"
 import { evaluateLdapLookup, type LdapLookupResult } from "@/lib/auth/ldapDiagnostic"
+import { forkLdapFetch } from "@/fork/ldap/fetch" // FORK: see FORK.md
 
 export const runtime = "nodejs"
 
@@ -49,7 +50,7 @@ export async function POST(req: Request) {
 
     let res: Response
     try {
-      res = await fetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/lookup`, {
+      res = await forkLdapFetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/lookup`, {
         method: "POST",
         headers,
         body: JSON.stringify({

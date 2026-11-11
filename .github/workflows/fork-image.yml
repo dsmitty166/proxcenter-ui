@@ -1,0 +1,85 @@
+# FORK: builds the fork's frontend image and publishes it to this repository's
+# GitHub Container Registry as ghcr.io/<owner, lower-case>/proxcenter-frontend-fork.
+# (Upstream's docker-publish.yml cannot publish from the fork: its build waits
+# on a job that needs upstream's private orchestrator token.)
+#
+#   push to main      -> :main and :sha-<short>
+#   tag fork-vX.Y.Z   -> :X.Y.Z and :latest
+#   pull request      -> build only, nothing pushed
+name: Fork image
+
+on:
+  push:
+    branches: [main]
+    tags: ['fork-v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    # Repo variable FORK_RUNS_ON picks the runner (JSON label or list, e.g. ["self-hosted","linux"]).
+    runs-on: ${{ fromJSON(vars.FORK_RUNS_ON || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # git describe needs the upstream tags
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Version
+        id: v
+        run: |
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo dev)
+          if [[ "$GITHUB_REF" == refs/tags/fork-v* ]]; then v="${GITHUB_REF#refs/tags/fork-v}"; else v="${base#v}-fork.${GITHUB_SHA::7}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Image name
+        id: img
+        # Registry paths must be lower-case; owners such as Name_Org are not.
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/proxcenter-frontend-fork" >> "$GITHUB_OUTPUT"
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=match,pattern=fork-v(.*),group=1
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/fork-v') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ steps.v.outputs.version }}
+          cache-from: type=gha,scope=fork-frontend
+          cache-to: type=gha,mode=max,scope=fork-frontend
+          platforms: linux/amd64

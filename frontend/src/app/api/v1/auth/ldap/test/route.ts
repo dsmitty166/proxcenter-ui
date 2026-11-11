@@ -4,6 +4,7 @@ import { NextResponse } from "next/server"
 import { PERMISSIONS } from "@/lib/rbac"
 import { requireProviderAdmin } from "@/lib/tenant/providerGuard"
 import { bindPasswordOrSaved } from "@/lib/auth/ldap"
+import { forkLdapFetch } from "@/fork/ldap/fetch" // FORK: see FORK.md
 
 export const runtime = "nodejs"
 
@@ -133,7 +134,7 @@ async function testLdapViaOrchestrator(config: {
       headers['X-API-Key'] = ORCHESTRATOR_API_KEY
     }
 
-    const res = await fetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/test`, {
+    const res = await forkLdapFetch(`${ORCHESTRATOR_URL}/api/v1/auth/ldap/test`, {
       method: 'POST',
       headers,
       body: JSON.stringify({

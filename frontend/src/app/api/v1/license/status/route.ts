@@ -4,6 +4,7 @@ import { orchestratorHeaders } from "@/lib/orchestrator/headers"
 import { isOfflineMode } from "@/lib/offline"
 import { checkPermission, PERMISSIONS } from "@/lib/rbac"
 import { requireProviderTenant } from "@/lib/tenant"
+import { forkStatusFields } from "@/fork/features" // FORK: see FORK.md
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
@@ -17,6 +18,7 @@ const DEFAULT_COMMUNITY_STATUS = {
   edition: 'community',
   features: ['dashboard', 'inventory', 'backups', 'storage'],
   options: [],
+  ...forkStatusFields(), // FORK: tells the browser which features the fork switches on
 }
 
 // Whoever holds the pairing code can approve the pairing on the portal and

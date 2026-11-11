@@ -1,0 +1,143 @@
+# FORK: weekly merge of the latest upstream release into this fork.
+#
+# 1. Mirrors upstream main into the `upstream` branch (read-only reference:
+#    `git diff upstream...main` shows exactly what the fork changes).
+# 2. If the newest upstream release tag (vX.Y.Z) is not in main yet, merges it
+#    into a `sync/upstream-vX.Y.Z` branch and opens a pull request. Fork CI
+#    and upstream's checks run on that PR; review and merge it.
+# 3. If the merge conflicts, opens an issue listing the conflicting files
+#    instead. Resolve locally (see FORK.md, "Merging upstream").
+#
+# Set a FORK_SYNC_TOKEN secret: a fine-grained PAT on this repo with Contents,
+# Pull requests, Issues and Workflows read/write. Without it the default
+# GITHUB_TOKEN is used, which (a) cannot push a merge that touches upstream
+# .github/workflows files and (b) opens PRs on which no checks run.
+name: Fork upstream sync
+
+on:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to merge (default: newest vX.Y.Z)'
+        required: false
+
+concurrency:
+  group: fork-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM: https://github.com/adminsyspro/proxcenter-ui.git
+
+jobs:
+  sync:
+    # Repo variable FORK_RUNS_ON picks the runner (JSON label or list, e.g. ["self-hosted","linux"]).
+    runs-on: ${{ fromJSON(vars.FORK_RUNS_ON || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          # The token is not stored in .git/config: only the two pushes below
+          # receive it, through a one-off header (zizmor: artipacked).
+          persist-credentials: false
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          git fetch upstream 'refs/tags/v*:refs/tags/v*' --force
+
+      - name: Mirror upstream main into the upstream branch
+        continue-on-error: true # needs the Workflows permission when upstream changed a workflow
+        env:
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          git -c "http.https://github.com/.extraheader=$auth" push --force origin refs/remotes/upstream/main:refs/heads/upstream
+
+      - name: Pick the release to merge
+        id: pick
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | grep -Ev -- '-(rc|beta|alpha|staging)' | head -1)}"
+          if [ -z "$tag" ] || ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::upstream tag '$tag' not found"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "refs/tags/$tag" HEAD; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+            echo "main already contains $tag"
+          fi
+
+      - name: Merge the release into a sync branch
+        id: merge
+        if: steps.pick.outputs.already != 'true'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          PUSH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          branch="sync/upstream-$TAG"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"; echo "$branch already pushed"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          if git merge --no-ff --no-edit -m "Merge upstream $TAG" "refs/tags/$TAG"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+            echo "::add-mask::$auth"
+            git -c "http.https://github.com/.extraheader=$auth" push origin "$branch"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            git merge --abort
+          fi
+
+      - name: Open the sync pull request
+        if: steps.merge.outputs.conflict == 'false'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          gh pr create --base main --head "$BRANCH" \
+            --title "Merge upstream $TAG" \
+            --body "Automated merge of upstream release [$TAG](https://github.com/adminsyspro/proxcenter-ui/releases/tag/$TAG).
+
+          Merged cleanly. Before merging this PR, check that **Fork CI** is green: it fails if an upstream change moved or removed one of the fork hooks, even when git merged without conflict. See FORK.md."
+
+      - name: Report a conflicting merge
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+        run: |
+          title="Upstream $TAG does not merge cleanly"
+          if gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            echo "issue already open"; exit 0
+          fi
+          {
+            echo "Merging upstream release $TAG into main conflicts in:"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+            echo
+            echo "Resolve locally, following FORK.md \"Merging upstream\":"
+            echo
+            echo '```sh'
+            echo "git fetch upstream --tags && git switch -c sync/upstream-$TAG origin/main"
+            echo "git merge $TAG"
+            echo '```'
+          } > "$RUNNER_TEMP/body.md"
+          gh issue create --title "$title" --body-file "$RUNNER_TEMP/body.md"
