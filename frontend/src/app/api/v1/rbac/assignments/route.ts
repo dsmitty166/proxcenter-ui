@@ -1,40 +1,47 @@
 export const dynamic = "force-dynamic"
 // src/app/api/v1/rbac/assignments/route.ts
-import { NextRequest, NextResponse } from "next/server"
-
-import { getServerSession } from "next-auth"
+import { NextResponse } from "next/server"
 
 import { nanoid } from "nanoid"
 
-import { authOptions } from "@/lib/auth/config"
+import { authorizeAdminRead, authorizeAdminWrite, ownRolesError } from "@/lib/auth/actingUser"
 import { prisma } from "@/lib/db/prisma"
 import { audit } from "@/lib/audit"
-import { hasPermission, isUserSuperAdmin, PROTECTED_ROLE_IDS } from "@/lib/rbac"
+import { isUserSuperAdmin, PERMISSIONS, PROTECTED_ROLE_IDS } from "@/lib/rbac"
 import { guardRoleAssignment } from "@/lib/rbac/assignmentGuards"
+import { canReadRoleAssignments } from "@/lib/rbac/assignmentReadAccess"
 import { isServiceDeskManaged } from "@/lib/rbac/serviceDesk"
 import { validateAssignmentScope } from "@/lib/rbac/scope-validation"
 import { DEFAULT_TENANT_ID, getCurrentTenantId } from "@/lib/tenant"
 import { demoResponse } from "@/lib/demo/demo-api"
 import { withAudit } from "@/lib/audit/withAudit"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
 
 // GET /api/v1/rbac/assignments - Liste toutes les assignations
-export async function GET(req: NextRequest) {
+async function handleGet(req: Request) {
   const demo = demoResponse(req)
   if (demo) return demo
 
   try {
-    const session = await getServerSession(authOptions)
-
-    if (!session?.user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-    }
+    const reader = await authorizeAdminRead(PERMISSIONS.ADMIN_RBAC_VIEW)
+    if (reader.denied) return reader.denied
 
     const tenantId = await getCurrentTenantId()
     const url = new URL(req.url)
     const userIdFilter = url.searchParams.get("user_id")
     const roleIdFilter = url.searchParams.get("role_id")
 
-    const callerIsSuperAdmin = await isUserSuperAdmin(session.user.id)
+    // Without admin.users or admin.rbac (or their .view), the caller's own
+    // assignments only (roadmap#223). A token reached this line through
+    // admin.rbac.view, a session through its sign-in only.
+    const selfId = reader.userId
+    const readsAll = !selfId || (await canReadRoleAssignments(selfId, tenantId))
+    if (!readsAll && userIdFilter && userIdFilter !== selfId) {
+      return NextResponse.json({ data: [], meta: { total: 0 } })
+    }
+    const userIdScope = readsAll ? userIdFilter : selfId
+
+    const callerIsSuperAdmin = reader.isSuperAdmin
     const now = new Date()
 
     // Hide every trace of protected roles (super_admin + provider_admin) —
@@ -61,7 +68,7 @@ export async function GET(req: NextRequest) {
     // provider screen even though the user is listed there.
     const isProviderView = tenantId === DEFAULT_TENANT_ID
     const where: any = isProviderView ? {} : { tenantId }
-    if (userIdFilter) where.userId = userIdFilter
+    if (userIdScope) where.userId = userIdScope
     if (roleIdFilter) where.roleId = roleIdFilter
     if (!callerIsSuperAdmin) {
       where.roleId = { ...(where.roleId ? { equals: where.roleId } : {}), notIn: [...PROTECTED_ROLE_IDS] }
@@ -131,7 +138,7 @@ export async function GET(req: NextRequest) {
           user: {
             tenants: { some: { tenantId } },
           },
-          ...(userIdFilter ? { userId: userIdFilter } : {}),
+          ...(userIdScope ? { userId: userIdScope } : {}),
         },
         include: {
           user: { select: { id: true, email: true, name: true } },
@@ -219,23 +226,20 @@ return NextResponse.json(
   }
 }
 
+export const GET = withPublicApiGuard("rbac-assignments-list", handleGet)
+
 // POST /api/v1/rbac/assignments - Assigner un rôle à un utilisateur
-async function handlePost(req: NextRequest) {
+async function handlePost(req: Request) {
   const demo = demoResponse(req)
   if (demo) return demo
 
   try {
-    const session = await getServerSession(authOptions)
-
-    if (!session?.user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-    }
+    // A session needs admin.rbac in its tenant; a token needs it from its
+    // rbac:write scope and never acts as a super admin.
+    const writer = await authorizeAdminWrite("admin.rbac")
+    if (writer.denied) return writer.denied
 
     const tenantId = await getCurrentTenantId()
-
-    if (!(await hasPermission({ userId: session.user.id, permission: "admin.rbac", tenantId }))) {
-      return NextResponse.json({ error: "Admin rights required" }, { status: 403 })
-    }
 
     const body = await req.json()
     const { user_id, role_id, scope_type, scope_target, expires_at, tenant_id: bodyTenantId } = body
@@ -266,11 +270,8 @@ async function handlePost(req: NextRequest) {
 
     // Prevent self-escalation / self-lockout: a user cannot change their own
     // RBAC assignments. Another admin must do it.
-    if (user_id === session.user.id) {
-      return NextResponse.json(
-        { error: "You cannot change your own roles" },
-        { status: 400 }
-      )
+    if (user_id === writer.selfUserId) {
+      return NextResponse.json({ error: ownRolesError(writer, "change") }, { status: 400 })
     }
 
     // The rules every role grant obeys (lib/rbac/assignmentGuards.ts):
@@ -279,7 +280,7 @@ async function handlePost(req: NextRequest) {
     // reachable from the target tenant, and NIC identity rights come from a
     // super admin.
     const guard = await guardRoleAssignment({
-      callerUserId: session.user.id,
+      callerUserId: writer.userId ?? "",
       roleId: role_id,
       targetTenantId,
       targetUserId: user_id,
@@ -360,7 +361,7 @@ async function handlePost(req: NextRequest) {
         scopeType,
         scopeTarget,
         tenantId: targetTenantId,
-        grantedById: session.user.id,
+        grantedById: writer.userId ?? null,
         grantedAt: now,
         expiresAt,
       },
@@ -370,8 +371,8 @@ async function handlePost(req: NextRequest) {
     await audit({
       action: "rbac_role_assigned",
       category: "security",
-      userId: session.user.id,
-      userEmail: session.user.email,
+      userId: writer.userId,
+      userEmail: writer.userEmail,
       resourceType: "user",
       resourceId: user_id,
       resourceName: user.email,
@@ -408,4 +409,4 @@ return NextResponse.json(
   }
 }
 
-export const POST = withAudit({ category: "security", resourceType: "assignment" }, handlePost)
+export const POST = withAudit({ category: "security", resourceType: "assignment" }, withPublicApiGuard("rbac-assignment-create", handlePost))

@@ -92,6 +92,12 @@ export const ALL_PERMISSIONS: Permission[] = [
   { id: "admin.compliance", name: "admin.compliance", category: "admin", description: "Manage compliance and security policies", isDangerous: true },
   { id: "admin.tenants", name: "admin.tenants", category: "admin", description: "Manage tenants (multi-tenancy)", isDangerous: true },
   { id: "admin.apitokens", name: "admin.apitokens", category: "admin", description: "Manage API tokens (create, revoke)", isDangerous: true },
+  { id: "admin.identity", name: "admin.identity", category: "admin", description: "Manage the tenant's own identity provider, when the provider allows it", isDangerous: true },
+  { id: "admin.users.view", name: "admin.users.view", category: "admin", description: "View users and their tenant memberships (implied by admin.users)" },
+  { id: "admin.rbac.view", name: "admin.rbac.view", category: "admin", description: "View roles, permissions and role assignments (implied by admin.rbac)" },
+  { id: "admin.settings.view", name: "admin.settings.view", category: "admin", description: "View provider settings: vDCs, EVPN zones, storage policies (implied by admin.settings)" },
+  { id: "admin.tenants.view", name: "admin.tenants.view", category: "admin", description: "View tenants and their members (implied by admin.tenants)" },
+  { id: "admin.settings.vdcs", name: "admin.settings.vdcs", category: "admin", description: "Manage vDCs, their GPU quota, storage policies and shared EVPN zones (implied by admin.settings)", isDangerous: true },
 
   // SDN / VNet
   { id: "sdn.vnet.view", name: "sdn.vnet.view", category: "sdn", description: "List and view VNets in own vDCs" },
@@ -203,6 +209,8 @@ export const ROLES: RoleSeed[] = [
       "backup.view", "backup.restore", "backup.delete",
       "backup.job.view", "backup.job.create", "backup.job.edit", "backup.job.delete", "backup.job.run",
       "admin.users", "admin.rbac", "admin.settings", "admin.audit",
+      // issue #1289: only effective once the provider opens self-service.
+      "admin.identity",
       "alerts.view", "alerts.manage",
       "events.view", "tasks.view",
       "reports.view",
