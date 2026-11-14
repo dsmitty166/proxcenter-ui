@@ -2,15 +2,14 @@ export const dynamic = "force-dynamic"
 // src/app/api/v1/rbac/roles/[id]/route.ts
 import { NextRequest, NextResponse } from "next/server"
 
-import { getServerSession } from "next-auth"
-
 import { Prisma } from "@prisma/client"
 
-import { authOptions } from "@/lib/auth/config"
+import { authorizeAdminRead, getActingSession } from "@/lib/auth/actingUser"
 import { prisma } from "@/lib/db/prisma"
 import { audit } from "@/lib/audit"
-import { isUserSuperAdmin, PROTECTED_ROLE_IDS } from "@/lib/rbac"
+import { isUserSuperAdmin, PERMISSIONS, PROTECTED_ROLE_IDS } from "@/lib/rbac"
 import { validateRoleDefaultScopes } from "@/lib/rbac/scope-validation"
+import { canReadRoleAssignments } from "@/lib/rbac/assignmentReadAccess"
 import { findUnknownTenant, refuseOverCeiling } from "@/lib/rbac/catalogueGuards"
 import {
   isRoleAssignableInTenant,
@@ -24,6 +23,7 @@ import { DEFAULT_TENANT_ID } from "@/lib/tenant/constants"
 import { getCurrentTenantId } from "@/lib/tenant"
 import { demoResponse } from "@/lib/demo/demo-api"
 import { withAudit } from "@/lib/audit/withAudit"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
 
 /** See POST /api/v1/rbac/roles — same shape, same dedup rules. */
 function normalizeWidgetOverrides(raw: unknown): { hidden: string[] } | null | undefined {
@@ -66,19 +66,16 @@ function isRoleReachableFromTenant(role: { tenantId: string | null }, currentTen
 }
 
 // GET /api/v1/rbac/roles/[id] - Détails d'un rôle
-export async function GET(req: NextRequest, context: RouteContext) {
+async function handleGet(req: Request, context: RouteContext) {
   const demo = demoResponse(req)
   if (demo) return demo
 
   try {
-    const session = await getServerSession(authOptions)
-
-    if (!session?.user) {
-      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-    }
+    const reader = await authorizeAdminRead(PERMISSIONS.ADMIN_RBAC_VIEW)
+    if (reader.denied) return reader.denied
 
     const { id } = await context.params
-    const superAdminBlock = await denyIfProtectedRoleAndCallerIsNot(id, session.user.id)
+    const superAdminBlock = await denyIfProtectedRoleAndCallerIsNot(id, reader.userId)
     if (superAdminBlock) return superAdminBlock
 
     const tenantId = await getCurrentTenantId()
@@ -108,6 +105,10 @@ export async function GET(req: NextRequest, context: RouteContext) {
       return NextResponse.json({ error: "Role not found" }, { status: 404 })
     }
 
+    // The role's holders only with admin.users or admin.rbac (or their
+    // .view), roadmap#223; a token reached this line through admin.rbac.view.
+    const holders = !reader.userId || (await canReadRoleAssignments(reader.userId, tenantId)) ? role.userRoles : []
+
     return NextResponse.json({
       data: {
         id: role.id,
@@ -128,7 +129,7 @@ export async function GET(req: NextRequest, context: RouteContext) {
           description: rp.permission.description,
           is_dangerous: rp.permission.isDangerous,
         })),
-        users: role.userRoles.map(ur => ({
+        users: holders.map(ur => ({
           assignment_id: ur.id,
           scope_type: ur.scopeType,
           scope_target: ur.scopeTarget,
@@ -152,13 +153,15 @@ return NextResponse.json(
   }
 }
 
+export const GET = withPublicApiGuard("rbac-role-get", handleGet)
+
 // PATCH /api/v1/rbac/roles/[id] - Modifier un rôle
 async function handlePatch(req: NextRequest, context: RouteContext) {
   const demo = demoResponse(req)
   if (demo) return demo
 
   try {
-    const session = await getServerSession(authOptions)
+    const session = await getActingSession()
 
     if (!session?.user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
@@ -461,7 +464,7 @@ async function handleDelete(req: NextRequest, context: RouteContext) {
   if (demo) return demo
 
   try {
-    const session = await getServerSession(authOptions)
+    const session = await getActingSession()
 
     if (!session?.user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })

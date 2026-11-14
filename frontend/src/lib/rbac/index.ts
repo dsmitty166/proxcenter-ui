@@ -10,6 +10,7 @@
 import { NextResponse } from "next/server"
 
 import { SENSITIVE_NIC_PERMISSIONS } from './nicPermissions'
+import { PROTECTED_ROLE_IDS, PROVIDER_ONLY_ROLE_IDS } from './roleIds'
 import { isRoleAvailableInTenant } from './rolePublication'
 
 /**
@@ -254,7 +255,19 @@ const GLOBAL_SCOPE_PERMISSIONS: ReadonlySet<string> = new Set([
   "admin.compliance",
   "admin.tenants",
   "admin.apitokens",
+  "admin.identity",
 ])
+
+/**
+ * Whether a resource-less check of `permission` needs a `global` grant: the
+ * tenant-wide admin permissions above and their read-only children
+ * (`admin.users.view`, ...), which are no less tenant-wide for being reads.
+ */
+export function isGlobalScopePermission(permission: string): boolean {
+  if (GLOBAL_SCOPE_PERMISSIONS.has(permission)) return true
+  const parent = permission.split(".").slice(0, 2).join(".")
+  return parent !== permission && GLOBAL_SCOPE_PERMISSIONS.has(parent)
+}
 
 /**
  * Sync predicate over preloaded grants. Equivalent to one `hasPermission`
@@ -272,7 +285,7 @@ export function checkGrants(
   // A resource-less check of a tenant-wide admin permission demands a global
   // grant: a narrow scope must never stand in for "across the whole tenant".
   const requireGlobalGrant =
-    !resourceType && !resourceId && GLOBAL_SCOPE_PERMISSIONS.has(permission)
+    !resourceType && !resourceId && isGlobalScopePermission(permission)
   for (const g of grants.byScope) {
     if (!grantsPermission(g.permissions, permission)) continue
     if (requireGlobalGrant) {
@@ -299,38 +312,7 @@ export async function isUserSuperAdmin(userId: string): Promise<boolean> {
   return !!row
 }
 
-/**
- * Role IDs that must stay hidden from non-super-admin callers and may not be
- * assigned by anyone other than a super admin. Both grant wildcard permissions
- * (see seed in prisma/seed.ts); exposing either to a tenant admin lets them
- * escalate to full cluster access.
- */
-export const PROTECTED_ROLE_IDS = ["role_super_admin", "role_provider_admin"] as const
-
-/**
- * Roles meant for the provider tenant (or single-tenant Community installs)
- * and that grant `automation.view` (DRS / Site Recovery / Network Security /
- * Flows / Resources). Assigning them inside a non-default tenant unlocks
- * orchestration pages that Tenant Admin explicitly omits — see seed.ts where
- * role_tenant_admin's permission list comments why `automation.*` is dropped.
- *
- * Enforcement is twofold:
- *  - server-side: POST/PATCH /api/v1/rbac/assignments refuse to bind any of
- *    these to a tenantId other than `default` (see DEFAULT_TENANT_ID).
- *  - client-side: /security/rbac filters them out of the role dropdown when
- *    the target tenant isn't `default`.
- *
- * role_vm_user has no automation perms but stays here because it belongs to
- * the same legacy "global" role family — tenant operators should use the
- * tenant_* taxonomy (role_tenant_admin / role_tenant_operator /
- * role_tenant_viewer) which is the supported surface for vDC tenants.
- */
-export const PROVIDER_ONLY_ROLE_IDS = [
-  "role_operator",
-  "role_vm_admin",
-  "role_viewer",
-  "role_vm_user",
-] as const
+export { PROTECTED_ROLE_IDS, PROVIDER_ONLY_ROLE_IDS }
 
 /**
  * Check if a user holds any protected role (super_admin or provider_admin).
@@ -616,10 +598,21 @@ export const PERMISSIONS = {
   ADMIN_USERS: "admin.users",
   ADMIN_RBAC: "admin.rbac",
   ADMIN_SETTINGS: "admin.settings",
+  // Read-only children of the admin rights (issue #1360): implied by their
+  // parent, grantable on their own, and the only keys an API read scope maps.
+  ADMIN_USERS_VIEW: "admin.users.view",
+  ADMIN_RBAC_VIEW: "admin.rbac.view",
+  ADMIN_SETTINGS_VIEW: "admin.settings.view",
+  ADMIN_TENANTS_VIEW: "admin.tenants.view",
+  // Child of admin.settings that the vdcs:write API scope maps (issue #1360):
+  // the vDC lifecycle, GPU quota, storage policies and shared EVPN zones.
+  ADMIN_SETTINGS_VDCS: "admin.settings.vdcs",
   ADMIN_AUDIT: "admin.audit",
   ADMIN_COMPLIANCE: "admin.compliance",
   ADMIN_TENANTS: "admin.tenants",
   ADMIN_APITOKENS: "admin.apitokens",
+  // A tenant manages its own identity provider (issue #1289).
+  ADMIN_IDENTITY: "admin.identity",
 
   // SDN / VNet
   SDN_VNET_VIEW: "sdn.vnet.view",
@@ -773,6 +766,9 @@ export async function holdsBroadPermission(
   if (grants.superAdmin) return true
   const holding = grants.byScope.filter(g => grantsPermission(g.permissions, permission))
   if (holding.some(g => g.scopeType === "global")) return true
+  // A tenant-wide admin right is never made broad by connection grants: a
+  // token perimeter does not narrow a list of users, roles or tenants.
+  if (isGlobalScopePermission(permission)) return false
   if (!connectionIds || connectionIds.length === 0) return false
   return connectionIds.every(id =>
     holding.some(g => g.scopeType === "connection" && g.scopeTarget === id),

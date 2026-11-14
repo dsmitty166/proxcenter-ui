@@ -23,6 +23,9 @@ vi.mock("@/lib/auth/requireEnterprise", async orig => ({
   requireEnterprise: requireEnterpriseMock,
 }))
 vi.mock("@/lib/db/prisma", () => ({ prisma: {} }))
+// Upstream's IaaS-tenant guard sits between the Enterprise and ownership
+// guards; let it pass, as for a provider caller.
+vi.mock("@/lib/tenant/iaasGuard", () => ({ denyIaasTenant: vi.fn(async () => null) }))
 
 const ENTERPRISE_ONLY = new Response(JSON.stringify({ error: "Enterprise feature" }), { status: 403 })
 const OWNERSHIP_REACHED = new Response(JSON.stringify({ reached: "ownership" }), { status: 418 })

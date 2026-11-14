@@ -8,6 +8,7 @@ import { checkPermission, PERMISSIONS } from '@/lib/rbac'
 import { requireEnterprise } from '@/lib/auth/requireEnterprise'
 import { forkGrants } from '@/fork/features' // FORK: see FORK.md
 import { verifyConnectionOwnership, getSessionPrisma } from '@/lib/tenant'
+import { denyIaasTenant } from '@/lib/tenant/iaasGuard'
 import { collectHardeningData } from '@/lib/compliance/collectHardeningData'
 import { runAllChecks } from '@/lib/compliance/hardening'
 import { FRAMEWORKS, getCrosswalk } from '@/lib/compliance/frameworks'
@@ -28,6 +29,11 @@ export async function GET(req: Request) {
     // Guard 1: Enterprise-only feature
     const entGuard = forkGrants(null, 'compliance') ? null : await requireEnterprise() // FORK
     if (entGuard) return entGuard
+
+    // The whole cluster, over SSH too: not for an IaaS tenant, whose vDC
+    // binding would otherwise hand it the provider's connection.
+    const iaasDenied = await denyIaasTenant()
+    if (iaasDenied) return iaasDenied
 
     // Guard 2: Tenant ownership (matches hardening route pattern)
     const ownershipError = await verifyConnectionOwnership(connectionId)
