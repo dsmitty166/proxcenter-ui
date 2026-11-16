@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import type { CopyRateLimit } from '@/lib/migration/warm/copy-rate'
 
 import { DOWNTIME_BUDGET_DEFAULT_SEC } from '../components/migrationGuards'
 import { NFC_CONCURRENCY_DEFAULT } from '@/lib/migration/nfc-progress'
@@ -96,6 +97,10 @@ export function useMigrationOptions({
   // Warm only (#443). Off by default: the automatic budget stays the norm, and a
   // hold left on from an earlier run would park a migration nobody is watching.
   const [migManualCutover, setMigManualCutover] = useState(false)
+  // Warm with a manual cutover: seconds between two syncs of the hold. Null
+  // follows the source connection's setting; starts there every time, so an
+  // interval chosen for one wave never slows the syncs of the next.
+  const [migSyncIntervalSec, setMigSyncIntervalSec] = useState<number | null>(null)
   // Warm VMware only (#1000): default of the guest conversion at cutover. On
   // by default, the operator confirms or changes it in the "Cutover now"
   // dialog; an automatic cutover applies it as is.
@@ -113,6 +118,10 @@ export function useMigrationOptions({
   // cap of the target PVE connection", 0 means unlimited. Starts empty so
   // a cap typed for one busy array never silently slows the next run.
   const [migZeroRateLimit, setMigZeroRateLimit] = useState('')
+  // Warm only: copy rate cap of the migration or the batch (lib/migration/warm/copy-rate).
+  // Starts without a cap every time: a cap chosen for a busy day must never
+  // silently slow the next run.
+  const [migCopyRateLimit, setMigCopyRateLimit] = useState<CopyRateLimit | null>(null)
   // Bulk only (roadmap#53): how many migrations of the batch run at once, 1 to
   // 5. Starts sequential every time: a wave sized for an idle night must never
   // inherit the parallelism of the previous one.
@@ -148,10 +157,12 @@ export function useMigrationOptions({
     setMigConvertToQcow2(false)
     setMigCpuType(MIGRATION_CPU_TYPE_DEFAULT)
     setMigManualCutover(false)
+    setMigSyncIntervalSec(null)
     setMigConvertGuest(true)
     setMigEfiPreEnrolledKeys(true)
     setMigDowntimeBudget(String(DOWNTIME_BUDGET_DEFAULT_SEC))
     setMigZeroRateLimit('')
+    setMigCopyRateLimit(null)
     setMigBulkConcurrency(BULK_MIG_CONCURRENCY_DEFAULT)
     setMigCopyVmk('')
   }, [esxiMigrateVm, bulkMigOpen])
@@ -181,6 +192,8 @@ export function useMigrationOptions({
     setMigCpuType,
     migManualCutover,
     setMigManualCutover,
+    migSyncIntervalSec,
+    setMigSyncIntervalSec,
     migConvertGuest,
     setMigConvertGuest,
     migEfiPreEnrolledKeys,
@@ -193,6 +206,8 @@ export function useMigrationOptions({
     setMigDowntimeBudget,
     migZeroRateLimit,
     setMigZeroRateLimit,
+    migCopyRateLimit,
+    setMigCopyRateLimit,
     migStep,
     setMigStep,
     migHardware,

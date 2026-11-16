@@ -1,0 +1,201 @@
+import type { MicrosegSuggestion, MicrosegZone } from '@/lib/microseg/types'
+
+import { cellView, type MatrixModel } from './matrixModel'
+import {
+  UNZONED_ID, bareIp, guestNodeId, moreNodeId, pveNodeId, zoneNodeId, type FlowFilters, type MapEdgeData, type ZoneGraph,
+} from './zoneGraph'
+import { byText } from './zoneLayout'
+import { byGuestName, guestKey, type PolicyGuest, type ZoneMember } from './zoneModel'
+
+/** The most guests the target picker lists for one search: typing narrows it. */
+export const MAX_OPTIONS = 50
+
+/** A running guest the map can be focused on, with the zone it belongs to (null: in no zone). */
+export type TargetGuest = {
+  key: string
+  vmid: number
+  name: string
+  type: 'qemu' | 'lxc'
+  node: string
+  status: string
+  ips: string[]
+  zoneId: string | null
+}
+
+/** The zone of each guest: the one it is tagged with, else the one it is queued for. */
+function zoneOfGuests(membersByZone: ReadonlyMap<string, ZoneMember[]>): Map<string, string> {
+  const tagged = new Map<string, string>()
+  const queued = new Map<string, string>()
+  for (const [zoneId, members] of membersByZone) {
+    for (const m of members) {
+      const into = m.pending ? queued : tagged
+      const key = guestKey(m.ref)
+      if (!into.has(key)) into.set(key, zoneId)
+    }
+  }
+  return new Map([...queued, ...tagged])
+}
+
+/** The running guests of the connection, by name, each with its zone. Pure. */
+export function targetCandidates(guests: PolicyGuest[], membersByZone: ReadonlyMap<string, ZoneMember[]>): TargetGuest[] {
+  const zoneOf = zoneOfGuests(membersByZone)
+  return guests
+    .filter(g => g.status === 'running')
+    .map(g => ({ key: guestKey(g), vmid: g.vmid, name: g.name, type: g.type, node: g.node, status: g.status, ips: g.ips ?? [], zoneId: zoneOf.get(guestKey(g)) ?? null }))
+    .sort(byGuestName)
+}
+
+/** A guest matches a search on its name (anywhere), its VMID or one of its addresses (from the start), any case. */
+export function matchesTarget(t: TargetGuest, query: string): boolean {
+  const q = query.trim().toLowerCase()
+  if (!q) return true
+  if (t.name.toLowerCase().includes(q) || String(t.vmid).startsWith(q)) return true
+  return t.ips.some(ip => ip.toLowerCase().startsWith(q) || bareIp(ip).startsWith(q))
+}
+
+/** The options of the picker for a search, in their order, at most MAX_OPTIONS. */
+export function filterTargets(candidates: TargetGuest[], query: string): TargetGuest[] {
+  return candidates.filter(c => matchesTarget(c, query)).slice(0, MAX_OPTIONS)
+}
+
+/** The addresses of a guest in their canonical form: read once per guest, then matched against many flows. */
+export const targetAddresses = (t: Pick<TargetGuest, 'ips'>): ReadonlySet<string> => new Set(t.ips.map(ip => bareIp(ip)).filter(Boolean))
+
+/** An observed flow whose sample source or destination address is one of `ips` (see targetAddresses). */
+export function involvesAddresses(s: Pick<MicrosegSuggestion, 'src_ip' | 'dst_ip'>, ips: ReadonlySet<string>): boolean {
+  return [s.src_ip, s.dst_ip].some(ip => !!ip && ips.has(bareIp(ip)))
+}
+
+/** An observed flow whose sample source or destination address is one of the guest's. */
+export function involvesTarget(s: Pick<MicrosegSuggestion, 'src_ip' | 'dst_ip'>, t: Pick<TargetGuest, 'ips'>): boolean {
+  return involvesAddresses(s, targetAddresses(t))
+}
+
+export type TargetFlow = {
+  suggestion: MicrosegSuggestion
+  direction: 'in' | 'out'
+  peerIp: string
+  /** The emitting zone of an outbound flow the guest receives, when no source address says who sent it. */
+  peerZoneId?: string
+  /** The emitting zone of an outbound flow the guest's zone emits when its sample source address is another member's (or unknown). */
+  fromZone?: string
+}
+
+/** The zone an outbound flow leaves from (`src_key` on older data), '' for an inbound flow. */
+const emittingZone = (s: MicrosegSuggestion): string => (s.direction === 'out' ? s.src_zone_id || s.src_key : '')
+
+/** The pending observed flows of the guest: outgoing when it is the source, else incoming; busiest first. */
+export function targetSuggestions(suggestions: MicrosegSuggestion[], t: TargetGuest): TargetFlow[] {
+  const ips = targetAddresses(t)
+  const own = (ip: string) => !!ip && ips.has(bareIp(ip))
+  // An outbound flow is aggregated per emitting zone with one sample address: it is the guest's when that address is its own
+  // or when it leaves the guest's zone, whichever member the sample address belongs to.
+  const ofZone = (s: MicrosegSuggestion) => !!t.zoneId && emittingZone(s) === t.zoneId
+  const emits = (s: MicrosegSuggestion) => own(s.src_ip) || ofZone(s)
+  return suggestions
+    .filter(s => s.status === 'pending' && (emits(s) || own(s.dst_ip)))
+    .map((s): TargetFlow => {
+      if (emits(s)) return { suggestion: s, direction: 'out', peerIp: s.dst_ip, ...(!own(s.src_ip) ? { fromZone: emittingZone(s) } : {}) }
+      const zone = !s.src_ip ? emittingZone(s) : ''
+      return { suggestion: s, direction: 'in', peerIp: s.src_ip, ...(zone ? { peerZoneId: zone } : {}) }
+    })
+    .sort((a, b) => Number(!!a.fromZone) - Number(!!b.fromZone) || b.suggestion.hits - a.suggestion.hits || Number(a.direction === 'in') - Number(b.direction === 'in') || byText(a.suggestion.id, b.suggestion.id))
+}
+
+/** The guest name of each known address (the first guest by name when two share one). */
+export function targetPeers(guests: PolicyGuest[]): Map<string, string> {
+  const peers = new Map<string, string>()
+  for (const g of [...guests].sort((a, b) => byText(a.name, b.name))) {
+    for (const ip of g.ips ?? []) if (!peers.has(bareIp(ip))) peers.set(bareIp(ip), g.name)
+  }
+  return peers
+}
+
+/**
+ * The node of the guest on a canvas: its glyph, else the "+N" of its circle, else the circle (or box) of its zone; on
+ * the node view, its glyph in the circle of its Proxmox node, else the "+N" of that circle, else the circle.
+ */
+export function targetNodeId(graph: ZoneGraph, t: TargetGuest): string | null {
+  const ids = new Set(graph.nodes.map(n => n.id))
+  const group = t.zoneId ?? UNZONED_ID
+  const pve = pveNodeId(t.node)
+  const tries = [guestNodeId(group, t.key), moreNodeId(group), t.zoneId ? zoneNodeId(t.zoneId) : null, guestNodeId(pve, t.key), moreNodeId(pve), pve]
+  return tries.find(id => !!id && ids.has(id)) ?? null
+}
+
+export type TargetFocus = {
+  /** The node of the guest (null when the canvas does not draw it). */
+  node: string | null
+  /** Lit: the guest, its zone, the ends of its observed pairs. */
+  nodes: Set<string>
+  /** Lit: the observed edges whose flows the guest is the sample source or destination of. */
+  edges: Set<string>
+  /** The top-level nodes kept (the guest's zone and the zones, or Unknown / External, of its pairs); the view fits to them. */
+  fit: string[]
+  /**
+   * Nodes and edges that have nothing to do with the guest: drawn as a faint outline. The allowed flows between two
+   * kept zones are neither lit nor faint: dimmed, as context.
+   */
+  faintNodes: Set<string>
+  faintEdges: Set<string>
+}
+
+/**
+ * The focus a targeted guest locks on a canvas, recentred on the guest (UA57): its node and its zone, the observed
+ * edges whose flows it is the sample source or destination of with their ends, lit; the allowed flows between the
+ * zones kept, dimmed; every other zone and edge a faint outline. Null without a target, and when the canvas draws
+ * nothing of it (the guest view centred on an unrelated zone): the map is then not dimmed. Pure.
+ */
+export function targetFocus(graph: ZoneGraph, t: TargetGuest | null): TargetFocus | null {
+  if (!t) return null
+  const parent = new Map(graph.nodes.map(n => [n.id, n.parentId]))
+  const top = (id: string) => parent.get(id) ?? id
+  const node = targetNodeId(graph, t)
+  const nodes = new Set<string>()
+  const kept = new Set<string>()
+  const light = (id: string) => {
+    nodes.add(id)
+    const p = parent.get(id)
+    if (p) nodes.add(p)
+    kept.add(top(id))
+  }
+  if (node) light(node)
+  if (t.zoneId && parent.has(zoneNodeId(t.zoneId))) light(zoneNodeId(t.zoneId))
+  const ips = targetAddresses(t)
+  const edges = new Set<string>()
+  for (const e of graph.edges) {
+    const d = e.data as unknown as MapEdgeData
+    if (d.kind === 'allowed' || d.kind === 'outside') continue
+    if (!d.observed.some(s => involvesAddresses(s, ips))) continue
+    edges.add(e.id)
+    light(e.source)
+    light(e.target)
+  }
+  if (!nodes.size) return null
+  const faintNodes = new Set(graph.nodes.filter(n => !kept.has(top(n.id))).map(n => n.id))
+  const faintEdges = new Set(graph.edges.filter(e => !edges.has(e.id) && (!kept.has(top(e.source)) || !kept.has(top(e.target)))).map(e => e.id))
+  return { node, nodes, edges, fit: [...kept], faintNodes, faintEdges }
+}
+
+/** The observed ribbons of the Sankey diagram (`${kind}:${cell}`) whose flows the guest is the sample end of. */
+export function targetRibbons(model: MatrixModel, filters: FlowFilters, t: TargetGuest): Set<string> {
+  const out = new Set<string>()
+  const ips = targetAddresses(t)
+  for (const cell of model.cells.values()) {
+    const view = cellView(cell, filters, null)
+    for (const s of view?.observed ?? []) {
+      if (involvesAddresses(s, ips)) out.add(`${s.kind === 'blocked' ? 'blocked' : 'unprotected'}:${cell.id}`)
+    }
+  }
+  return out
+}
+
+/** The Sankey diagram of a target: the node id of its zone and its ribbons. */
+export function targetSankey(model: MatrixModel, filters: FlowFilters, t: TargetGuest): { zone: string | null; ribbons: Set<string> } {
+  return { zone: t.zoneId ? zoneNodeId(t.zoneId) : null, ribbons: targetRibbons(model, filters, t) }
+}
+
+/** The colour of the ring of a targeted guest: its zone's ('' for the theme's primary colour). */
+export function targetRing(t: TargetGuest | null, zonesById: ReadonlyMap<string, MicrosegZone>): string {
+  return (t?.zoneId ? zonesById.get(t.zoneId)?.color : undefined) ?? ''
+}

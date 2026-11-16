@@ -17,6 +17,7 @@
  * on. The target VM is never touched: it may hold hours of copied data (#612);
  * the job log says where it is so the operator decides.
  */
+import { Prisma } from "@prisma/client"
 import { prisma as globalPrisma } from "@/lib/db/prisma"
 import { decryptSecret } from "@/lib/crypto/secret"
 import { soapConsolidateVmDisks, soapLogin, soapLogout, soapWaitForConsolidation } from "@/lib/vmware/soap"
@@ -28,6 +29,8 @@ import { getNodeSshEndpointForMigration } from "@/lib/migration/pve-tasks"
 import { sweepWarmSnapshots } from "./warm-pipeline"
 import { sweepOrphanReaders } from "./orphan-readers"
 import { unmapTargetVolumes } from "./finish"
+import { removeTestVm } from "./migration-test"
+import { readTestState } from "./migration-test-state"
 import { executeSSH } from "@/lib/ssh/exec"
 import { type SshTarget } from "@/lib/ssh/node-endpoint-core"
 import type { AllocatedVolume } from "@/lib/migration/pvesm-alloc"
@@ -207,7 +210,37 @@ export async function cleanupOrphanedWarmSource(jobId: string, deps: WarmOrphanC
       lines.push({ msg: `Target VM ${job.targetVmid} on ${job.targetNode} was left as the interrupted run made it. Delete it in Proxmox if you do not keep it; a retry creates a new VM.`, level: "warn" })
     }
 
-    // A newer run of the same VM owns whatever proxcenter-warm-* is there now.
+    let pveConn: Awaited<ReturnType<typeof getConnectionById>> | null = null
+    let nodeIp: Awaited<ReturnType<typeof getNodeSshEndpointForMigration>> | null = null
+    let unreachable = ""
+    try {
+      pveConn = await getConnectionById(job.targetConnectionId, job.tenantId)
+      nodeIp = await getNodeSshEndpointForMigration(prisma, job.targetConnectionId, job.targetNode, pveConn.baseUrl)
+    } catch (e: any) {
+      unreachable = e?.message || String(e)
+    }
+
+    // A test VM boots on overlays backed by the copy (migration-test.ts). Its
+    // VMID belongs to this job alone, so it goes even when a newer run of the
+    // same source exists, and before anything of the copy is released.
+    const test = readTestState(job.testState)
+    if (test?.testVmid && test.phase !== "ended" && test.phase !== "failed") {
+      try {
+        if (!pveConn) throw new Error(unreachable || `${job.targetNode} could not be reached`)
+        const removal = await removeTestVm({ pveConn, node: job.targetNode, vmid: test.testVmid, jobId: job.id, connectionId: job.targetConnectionId, nodeIp, overlays: test.overlays ?? [] })
+        if (!removal.removed) throw new Error(removal.reason)
+        await prisma.migrationJob.update({
+          where: { id: job.id },
+          data: { testState: { ...test, phase: "ended", reason: "the server restarted", endedAt: now().toISOString() } as any, testRequest: Prisma.DbNull, testStopRequestedAt: null },
+        })
+        lines.push({ msg: `Test VM ${test.testVmid} removed after the server restarted`, level: "info" })
+      } catch (e: any) {
+        lines.push({ msg: `Could not remove test VM ${test.testVmid} on ${job.targetNode} (${e?.message || e}): delete it in Proxmox, with its disks`, level: "warn" })
+      }
+    }
+
+    // A newer run of the same VM owns whatever proxcenter-warm-* is there now,
+    // and the reader on the node.
     const newer = await prisma.migrationJob.findFirst({
       where: { id: { not: job.id }, sourceConnectionId: job.sourceConnectionId, sourceVmId: job.sourceVmId, status: { notIn: [...TERMINAL_STATUSES, "queued"] } },
       select: { id: true },
@@ -218,10 +251,8 @@ export async function cleanupOrphanedWarmSource(jobId: string, deps: WarmOrphanC
     // the source disk open (NFC session on vSphere, NBD export on XCP-ng): the
     // snapshot then cannot go cleanly. Stop it first (a reader is only killed
     // when its job is terminal, which this one now is).
-    let nodeIp: Awaited<ReturnType<typeof getNodeSshEndpointForMigration>> | null = null
     try {
-      const pveConn = await getConnectionById(job.targetConnectionId, job.tenantId)
-      nodeIp = await getNodeSshEndpointForMigration(prisma, job.targetConnectionId, job.targetNode, pveConn.baseUrl)
+      if (!nodeIp) throw new Error(unreachable || `${job.targetNode} could not be reached`)
       await sweepOrphanReaders({
         connectionId: job.targetConnectionId, nodeIp, nodeName: job.targetNode, currentJobId: "",
         log: async (msg, level) => { lines.push({ msg, level: level ?? "info" }) },

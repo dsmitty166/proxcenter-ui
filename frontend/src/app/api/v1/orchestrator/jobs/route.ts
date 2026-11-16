@@ -356,11 +356,22 @@ export async function GET(req: Request) {
           target: migTarget,
           metadata: {
             connectionId: mj.targetConnectionId,
+            // What reopens the dialog the run was started from: its source
+            // host, and its batch for a bulk migration (migrationJobOpen).
+            sourceConnectionId: mj.sourceConnectionId,
+            batchId: mj.batchId ?? null,
             sourceVmName: mj.sourceVmName,
             sourceHost: mj.sourceHost,
             targetNode: mj.targetNode,
             targetVmid: mj.targetVmid,
             currentStep: mj.currentStep,
+            // The page shows "route • step" with the step translated
+            // (migrationStepText); a warm run's cancel offers to remove its copy.
+            route,
+            migrationStatus: mj.status,
+            migrationType: (mj.config as any)?.migrationType ?? null,
+            cutoverMode: (mj.config as any)?.cutoverMode ?? null,
+            projectedDowntimeSec: mj.projectedDowntimeSec ?? null,
             totalDisks: mj.totalDisks,
             currentDisk: mj.currentDisk,
             transferSpeed: mj.transferSpeed,

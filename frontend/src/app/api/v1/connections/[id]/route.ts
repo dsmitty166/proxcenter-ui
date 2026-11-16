@@ -15,6 +15,7 @@ import { checkPermission, PERMISSIONS } from "@/lib/rbac"
 import { invalidateConnectionCache } from "@/lib/connections/getConnection"
 import { invalidateInventoryCache } from "@/lib/cache/inventoryCache"
 import { invalidateGuestIpIndex } from "@/lib/cache/guestIpCache"
+import { evictGuestCoverage } from "@/lib/firewall/guestCoverage"
 import { updateConnectionSchema } from "@/lib/schemas"
 import { orchestratorFetch } from "@/lib/orchestrator/client"
 import { pveFetch } from "@/lib/proxmox/client"
@@ -237,7 +238,7 @@ async function handlePatch(req: Request, ctx: { params: Promise<{ id: string }> 
     // The bulk migration limits (ui#1332) follow the same gate: the cluster
     // and per-node limits of a PVE target, the per-host limit of a VMware source.
     const migrationFields = ['warmZeroRateLimitMBps', 'integrityCheckEnabled', 'integrityRegionCount', 'integrityRegionSizeMiB'] as const
-    const limitFieldSent = ([body.migrationMaxParallel, body.migrationMaxPerNode, body.migrationMaxPerSourceHost] as const).some(v => v !== undefined)
+    const limitFieldSent = ([body.migrationMaxParallel, body.migrationMaxPerNode, body.migrationMaxPerSourceHost, body.migrationSyncIntervalSec, body.migrationCopyRateLimitPerHostMBps] as const).some(v => v !== undefined)
     if ((migrationFields.some(f => body[f] !== undefined) || limitFieldSent) && await migrationFeatureLicensed()) {
       const current = await prisma.connection.findUnique({ where: { id }, select: { type: true } })
       if (current?.type === 'pve') {
@@ -435,6 +436,7 @@ async function handleDelete(_req: Request, ctx: { params: Promise<{ id: string }
     clearNodeIpCache(id)
     invalidateInventoryCache()
     invalidateGuestIpIndex(id)
+    evictGuestCoverage(id)
 
     // Audit
     const { audit } = await import("@/lib/audit")

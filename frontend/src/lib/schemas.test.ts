@@ -116,6 +116,15 @@ describe('connection schemas warmZeroRateLimitMBps (roadmap#45)', () => {
   })
 })
 
+describe('connection schemas per-host copy rate cap', () => {
+  it('accepts 0 to 100000 MB/s and null', () => {
+    for (const v of [0, 1, 50, 100_000, null]) expect(updateConnectionSchema.safeParse({ migrationCopyRateLimitPerHostMBps: v }).success, `${v}`).toBe(true)
+  })
+  it('refuses a negative value, more than 100000, a fraction or a string', () => {
+    for (const v of [-1, 100_001, 2.5, '4']) expect(updateConnectionSchema.safeParse({ migrationCopyRateLimitPerHostMBps: v }).success, `${v}`).toBe(false)
+  })
+})
+
 describe('connection schemas migration limits (ui#1332)', () => {
   const fields = ['migrationMaxParallel', 'migrationMaxPerNode', 'migrationMaxPerSourceHost']
   const pve = { name: 'p', type: 'pve' as const, baseUrl: 'https://10.0.0.1:8006', apiToken: 't' }
@@ -128,6 +137,21 @@ describe('connection schemas migration limits (ui#1332)', () => {
   it('refuses 0, more than 20, a fraction or a string', () => {
     for (const f of fields) for (const v of [0, 21, 2.5, '4']) {
       expect(updateConnectionSchema.safeParse({ [f]: v }).success, `${f}=${v}`).toBe(false)
+    }
+  })
+})
+
+describe('connection schemas sync interval of a warm hold', () => {
+  const vc = { name: 'v', type: 'vmware' as const, subType: 'vcenter', baseUrl: 'https://10.0.0.2', vmwareUser: 'u', vmwarePassword: 'p' }
+  it('accepts 60 to 86400 seconds and null', () => {
+    for (const v of [60, 900, 86400, null]) {
+      expect(createConnectionSchema.safeParse({ ...vc, migrationSyncIntervalSec: v }).success, String(v)).toBe(true)
+      expect(updateConnectionSchema.safeParse({ migrationSyncIntervalSec: v }).success, String(v)).toBe(true)
+    }
+  })
+  it('refuses less than a minute, more than a day, a fraction or a string', () => {
+    for (const v of [59, 86401, 90.5, '900']) {
+      expect(updateConnectionSchema.safeParse({ migrationSyncIntervalSec: v }).success, String(v)).toBe(false)
     }
   })
 })

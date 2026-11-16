@@ -3,6 +3,10 @@
 // dozens of VMs stays readable page by page.
 
 import { mergeJobLogs } from '@/lib/migration/jobLogs'
+import { parseCutoverMeasure, type CutoverMeasure } from '@/lib/migration/warm/sync-interval'
+import { isTestActive } from '@/lib/migration/warm/migration-test-state'
+
+const measureOf = (job: { syncMeasure?: unknown }) => parseCutoverMeasure(job.syncMeasure)
 
 export interface BulkJobLike {
   vmid: string
@@ -101,6 +105,18 @@ export interface BulkMigJobRow {
   bytesTransferred?: number
   /** The engine's live copy rate ("33 MB/s"), preferred to the counter for the throughput. */
   transferSpeed?: string | null
+  /** Downtime the last delta pass of a warm job projects for a cutover now, in seconds. */
+  projectedDowntimeSec?: number | null
+  /** True for a warm job launched with a manual cutover: in delta_sync it waits for the operator. */
+  manualHold?: boolean
+  /** Interval a manual job syncs at while it waits, in seconds. */
+  syncIntervalSec?: number
+  /** Interval the engine suggests from the syncs it measured, in seconds. */
+  suggestedSyncIntervalSec?: number
+  /** What those syncs measured, the cutover is estimated from it. */
+  syncMeasure?: CutoverMeasure
+  /** A test VM runs on the copy of this waiting job (migration-test.ts). */
+  inTest?: boolean
 }
 
 /** A job as GET /api/v1/migrations/batches/[id] returns it (the fields read here). */
@@ -119,6 +135,14 @@ export interface BatchJobPayload {
   transferSpeed?: string | null
   bytesTransferred?: number | null
   startedAt?: string | null
+  projectedDowntimeSec?: number | null
+  /** "manual" for a warm job launched with a manual cutover, "auto" otherwise. */
+  cutoverMode?: string | null
+  syncIntervalSec?: number | null
+  suggestedSyncIntervalSec?: number | null
+  syncMeasure?: unknown
+  testRequest?: unknown
+  testState?: unknown
 }
 
 export interface BatchPayload {
@@ -150,10 +174,26 @@ export function bulkRowsFromBatch(jobs: BatchJobPayload[], previous: BulkMigJobR
       ...(j.error ? { error: j.error } : {}),
       ...(logs.length ? { logs } : {}),
       ...(j.targetNode ? { targetNode: j.targetNode } : {}),
+      ...(j.projectedDowntimeSec != null ? { projectedDowntimeSec: j.projectedDowntimeSec } : {}),
+      ...(j.cutoverMode === 'manual' ? { manualHold: true } : {}),
+      ...(j.cutoverMode === 'manual' && j.syncIntervalSec != null ? { syncIntervalSec: j.syncIntervalSec } : {}),
+      ...(j.cutoverMode === 'manual' && j.suggestedSyncIntervalSec != null ? { suggestedSyncIntervalSec: j.suggestedSyncIntervalSec } : {}),
+      ...(j.cutoverMode === 'manual' && measureOf(j) ? { syncMeasure: measureOf(j)! } : {}),
       ...(j.bytesTransferred != null && Number.isFinite(Number(j.bytesTransferred)) ? { bytesTransferred: Number(j.bytesTransferred) } : {}),
       ...(j.transferSpeed ? { transferSpeed: j.transferSpeed } : {}),
+      ...(!isTerminalJobStatus(j.status) && isTestActive(j) ? { inTest: true } : {}),
     }
   })
+}
+
+/** Colours and label of a bulk job row: done, failed, cancelled, queued (or paused), under test or running. */
+export function bulkJobRowTone(s: { isDone: boolean; isFailed: boolean; isCancelled: boolean; isQueued: boolean; isPaused: boolean; inTest?: boolean }): { line: string; chipBg: string; chipColor: string; labelKey?: string } {
+  if (s.isDone) return { line: 'success.main', chipBg: 'success.main', chipColor: 'success.contrastText', labelKey: 'completed' }
+  if (s.isFailed) return { line: 'error.main', chipBg: 'error.main', chipColor: 'error.contrastText', labelKey: 'failed' }
+  if (s.isCancelled) return { line: 'divider', chipBg: 'action.disabled', chipColor: 'common.white', labelKey: 'cancelled' }
+  if (s.isQueued) return { line: 'divider', chipBg: 'action.disabled', chipColor: 'common.white', labelKey: s.isPaused ? 'paused' : 'queued' }
+  if (s.inTest) return { line: 'divider', chipBg: 'info.main', chipColor: 'info.contrastText', labelKey: 'testRowLabel' }
+  return { line: 'divider', chipBg: 'primary.main', chipColor: 'primary.contrastText' }
 }
 
 /** The log lines each row already shows, in batch order: the `logsAfter` of the next read. */
@@ -227,4 +267,24 @@ export async function fetchActiveBulkBatch(sourceConnectionId: string): Promise<
   } catch {
     return null
   }
+}
+
+/**
+ * The jobs of a batch a group cutover can act on: the ones held for a manual
+ * cutover once a first sync gave a downtime projection (before that the engine
+ * has nothing to resume from), and the automatic ones parked at the operator
+ * gate because their projection exceeds the budget.
+ */
+export function bulkJobsAwaitingCutover(rows: BulkMigJobRow[]): BulkMigJobRow[] {
+  return rows.filter(r => r.status === 'awaiting_cutover' || (r.status === 'delta_sync' && r.manualHold === true && r.projectedDowntimeSec != null))
+}
+
+/**
+ * The jobs of a batch whose sync interval can still be changed: launched with
+ * a manual cutover and not over, queued ones included (the value then applies
+ * from their first wait). A job whose cutover is already running is refused by
+ * the server and named in its answer.
+ */
+export function bulkJobsWithSyncInterval(rows: BulkMigJobRow[]): BulkMigJobRow[] {
+  return rows.filter(r => r.manualHold === true && !isTerminalJobStatus(r.status) && r.status !== 'cutover')
 }

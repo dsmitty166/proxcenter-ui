@@ -44,8 +44,25 @@ vi.mock("../qcow2-convert", () => ({ convertDisksToQcow2: vi.fn() }))
 vi.mock("../job-heartbeat", () => ({ startJobHeartbeat: vi.fn() }))
 vi.mock("./xcpng-node-preflight", () => ({ checkNbdNodePreflight: vi.fn() }))
 vi.mock("./xapi-reader", () => ({ startXapiReader: vi.fn(), stopXapiReader: vi.fn(), readAllocatedExtents: vi.fn() }))
+vi.mock("./copy-rate-governor", () => ({ openCopyRateGovernor: vi.fn(async () => null) }))
 vi.mock("./checksum-detector", () => ({ detectChangedExtentsByChecksum: vi.fn(), scanBlockChecksums: vi.fn() }))
 vi.mock("./session-keepalive", () => ({ startSessionKeepAlive: vi.fn() }))
+// The slot a waiting job gives back and reclaims lives in Postgres and has its
+// own tests (hold-slot.test.ts); here the hold only has to sleep its interval
+// and wake on the operator's cutover, one minute as without any setting.
+vi.mock("./hold-slot", async () => {
+  const control = await import("./job-control")
+  return {
+    holdBetweenPasses: async (jobId: string, interval: number | (() => Promise<number>)) => {
+      const intervalSec = typeof interval === "number" ? interval : await interval()
+      if (control.isTestRequested(jobId)) { control.clearWarmTest(jobId); return "test" }
+      return (await control.sleepUnlessCutover(jobId, intervalSec * 1000)) ? "pass" : "cutover"
+    },
+  }
+})
+// The test itself has its own tests (migration-test.test.ts): here only what the pipeline hands it.
+vi.mock("./migration-test", () => ({ runMigrationTest: vi.fn(async () => {}) }))
+vi.mock("./sync-interval-source", () => ({ resolveSyncIntervalSec: vi.fn(async (own?: number) => own ?? 60) }))
 vi.mock("@/lib/xcpng/xapi-client", async importOriginal => {
   const actual = await importOriginal<typeof import("@/lib/xcpng/xapi-client")>()
   // CBT_CAPABLE_SR_TYPES and XapiError stay real.
@@ -81,8 +98,10 @@ import {
 import type { XoVmConfig } from "@/lib/xcpng/client"
 import type { Extent } from "./extents"
 import type { WarmMigrationConfig } from "./types"
-import { requestWarmCutover, requestWarmForcePowerOff, cancelWarmMigrationJob, acquireVmLock, releaseVmLock } from "./job-control"
+import { requestWarmCutover, requestWarmForcePowerOff, requestWarmTest, cancelWarmMigrationJob, requestCancelRemovesTarget, acquireVmLock, releaseVmLock } from "./job-control"
 import { runXcpngWarmMigration, XCPNG_SNAPSHOT_PREFIX } from "./xcpng-warm-pipeline"
+import { runMigrationTest } from "./migration-test"
+import { openCopyRateGovernor } from "./copy-rate-governor"
 
 // ── Fixtures ──
 
@@ -233,8 +252,15 @@ function makeFakePrisma() {
     return row
   })
   // Same guard as production: a throttled live flush never touches a terminal row.
+  // updateJob writes a step of a run still working through updateMany too,
+  // guarded against a row cancelled meanwhile: those go through the recorder.
   const updateMany = vi.fn(async ({ where, data }: any) => {
     if (where?.status?.notIn?.includes(row.status)) return { count: 0 }
+    if (where?.status?.not !== undefined) {
+      if (where.status.not === row.status) return { count: 0 }
+      await update({ data })
+      return { count: 1 }
+    }
     Object.assign(row, data)
     return { count: 1 }
   })
@@ -249,6 +275,7 @@ let prisma: ReturnType<typeof makeFakePrisma>
 
 const messages = () => (prisma.row.logs as Array<{ msg: string }>).map(l => l.msg)
 const hasLog = (needle: string) => messages().some(m => m.includes(needle))
+const logIndex = (needle: string) => messages().findIndex(m => m.includes(needle))
 /** Reader tags in start order, from the socket names the pipeline chose. */
 const readerTags = (jobId: string) =>
   vi.mocked(startXapiReader).mock.calls.map(c => c[2].sock.replace(`/tmp/proxcenter-xapi-${jobId}-`, "").replace(/\.sock$/, ""))
@@ -446,7 +473,7 @@ describe("runXcpngWarmMigration CBT path", () => {
     expect(hasLog("Delta pass 1: 0.1 MB")).toBe(true)
     expect(hasLog("Delta pass 2: 0.0 MB")).toBe(true)
     // 50 s of shutdown, boot and transfer, plus the guest conversion (#1000), on by default
-    expect(prisma.row.projectedDowntimeSec).toBe(110)
+    expect(prisma.row.projectedDowntimeSec).toBe(150)
 
     // cutover: confirmed power off, final delta, CBT switched back off
     expect(xapiCleanShutdown).toHaveBeenCalledTimes(1)
@@ -550,9 +577,41 @@ describe("runXcpngWarmMigration CBT path", () => {
     expect(prisma.updates.some(u => u.status === "delta_sync" && u.progress === 90)).toBe(true)
     // the verify reader refused to start: warning, not failure
     expect(hasLog("Verify (sampled) skipped on disk 1: nbd-client failed to attach")).toBe(true)
-    expect(createdSnapshots()).toBe(4) // full, delta-1, delta-2, cutover
-    expect(destroyed).toHaveLength(4)
+    // the copy is brought up to date while the source still runs, then the source stops
+    expect(hasLog("Cutover: one more sync first, while the source VM still runs")).toBe(true)
+    expect(logIndex("Catch-up sync:")).toBeLessThan(logIndex("Cutover: requesting clean guest shutdown"))
+    expect(createdSnapshots()).toBe(5) // full, delta-1, delta-2, catch-up, cutover
+    expect(destroyed).toHaveLength(5)
     expect(xapiLogout).toHaveBeenCalledTimes(1)
+  })
+
+  it("runs a test asked during the hold on the copied volumes, then syncs at once and cuts over on request", { timeout: 20000 }, async () => {
+    const jobId = "xcp-it-test"
+    changedBlocks = [SMALL_DELTA, [], [], []]
+    vmConfig = { ...makeVmConfig(), guestOS: "Microsoft Windows Server 2022 Standard" }
+    let armed = false
+    hooks.onLog = msg => {
+      if (!armed && msg.startsWith("Delta pass 1:")) { armed = true; requestWarmTest(jobId); setTimeout(() => requestWarmCutover(jobId), 30_000) }
+    }
+
+    // The test prepares its boot overlay while it runs, as the real one does.
+    vi.mocked(runMigrationTest).mockImplementationOnce(async t => { await t.prepareBoot?.("/mnt/x/images/901/vm-901-test-0.qcow2") })
+
+    const err = await runToEnd(jobId, makeConfig({ cutoverMode: "manual", convertGuest: true }))
+
+    expect(err).toBeNull()
+    expect(runMigrationTest).toHaveBeenCalledTimes(1)
+    const t = vi.mocked(runMigrationTest).mock.calls[0][0]
+    expect(t).toMatchObject({ jobId, targetConnectionId: "conn-pve", node: "pve1" })
+    expect(t.devices).toEqual(["/dev/zvol/DatastoreVM/vm-900-disk-0"])
+    expect(t.conversion).toMatchObject({ name: "Debian13", firmware: "bios", isWindows: true, memoryMB: 1024 })
+    expect(t.paramsFor(true).scsihw).toBe("virtio-scsi-single")
+    // the Xen PV drivers of a Windows guest are disabled on the test's boot overlay, never on the copy
+    expect(sshCommands.some(c => c.includes("virt-win-reg --format=qcow2 '/mnt/x/images/901/vm-901-test-0.qcow2'"))).toBe(true)
+    expect(hasLog("Test: Xen PV drivers disabled")).toBe(true)
+    // the pass after the test ran before the cutover
+    expect(hasLog("Delta pass 2:")).toBe(true)
+    expect(prisma.row.status).toBe("completed")
   })
 
   it("parks at the operator gate when the pass cap is reached over budget, then resumes on the request", { timeout: 20000 }, async () => {
@@ -570,7 +629,7 @@ describe("runXcpngWarmMigration CBT path", () => {
     expect(err).toBeNull()
     expect(prisma.row.status).toBe("completed")
     expect(prisma.statusHistory).toEqual(["planning", "enabling_cbt", "preparing_disks", "full_copy", "delta_sync", "awaiting_cutover", "cutover", "verify", "completed"])
-    expect(hasLog("Reached 1 delta passes; projected cutover downtime ~510s")).toBe(true)
+    expect(hasLog("Reached 1 delta passes; projected cutover downtime ~550s")).toBe(true)
     expect(hasLog("The source is changing faster than it converges.")).toBe(true)
     expect(hasLog("Operator requested cutover")).toBe(true)
     expect(createdSnapshots()).toBe(3) // full, delta-1, cutover
@@ -582,8 +641,9 @@ describe("runXcpngWarmMigration CBT path", () => {
   it("falls back to the allocated map of a disk whose CBT chain is broken", { timeout: 20000 }, async () => {
     const jobId = "xcp-it-cbtfail"
     // The operator asks for the cutover while the full copy is still running, so
-    // the delta loop breaks at its first check and the cutover pass is the only
-    // delta: its VDI.list_changed_blocks fails the way XAPI does after a coalesce.
+    // the delta loop breaks at its first check and the catch-up sync, run while
+    // the source is still up, is the first delta: its VDI.list_changed_blocks
+    // fails the way XAPI does after a coalesce.
     changedBlocks = [new XapiError("VDI_NO_CBT_METADATA", ["OpaqueRef:snapvdi2-0"])]
     hooks.onLog = msg => { if (msg.startsWith("Full copy done")) requestWarmCutover(jobId) }
 
@@ -595,10 +655,11 @@ describe("runXcpngWarmMigration CBT path", () => {
     expect(prisma.statusHistory).toEqual(["planning", "enabling_cbt", "preparing_disks", "full_copy", "cutover", "verify", "completed"])
     expect(hasLog("Operator requested cutover: proceeding to final delta")).toBe(true)
     expect(hasLog('Disk 0 ("disk"): changed block list unavailable (VDI_NO_CBT_METADATA OpaqueRef:snapvdi2-0); copying every allocated block')).toBe(true)
-    // allocated map read twice: the full pass, then the cutover pass as fallback
+    // allocated map read twice: the full pass, then the catch-up sync as fallback;
+    // the cutover pass that follows finds nothing left to copy
     expect(readAllocatedExtents).toHaveBeenCalledTimes(2)
-    expect(readerTags(jobId)).toEqual(["full-0", "cutover-0", "vrfy-0"])
-    expect(destroyed).toEqual(["OpaqueRef:snap1", "OpaqueRef:snap2"])
+    expect(readerTags(jobId)).toEqual(["full-0", "catchup-0", "vrfy-0"])
+    expect(destroyed).toEqual(["OpaqueRef:snap1", "OpaqueRef:snap2", "OpaqueRef:snap3"])
   })
 
   it("waits for a confirmed power off and honours the operator's forced power off", { timeout: 30000 }, async () => {
@@ -630,6 +691,32 @@ describe("runXcpngWarmMigration CBT path", () => {
     // polled while Running, then saw Halted after the hard power off
     expect(vi.mocked(xapiPowerState).mock.calls.length).toBeGreaterThan(10)
     expect(hasLog("Source powered off (confirmed): applying final delta")).toBe(true)
+  })
+})
+
+describe("runXcpngWarmMigration copy rate cap", () => {
+  it("caps the full and delta passes through a governor per reader, never the cutover pass nor the integrity check", { timeout: 20000 }, async () => {
+    const jobId = "xcp-it-rate"
+    // delta 1 carries data, delta 2 is empty, then the cutover pass carries data too
+    changedBlocks = [SMALL_DELTA, [], SMALL_DELTA]
+    const events: string[] = []
+    vi.mocked(openCopyRateGovernor).mockImplementation(async a => a.capped
+      ? { initialMbps: 30, start: () => { events.push(`start ${a.sock}`) }, stop: async () => { events.push(`stop ${a.sock}`) } }
+      : null)
+
+    const err = await runToEnd(jobId, makeConfig())
+
+    expect(err).toBeNull()
+    const calls = vi.mocked(startXapiReader).mock.calls.map(c => [c[2].sock.replace(`/tmp/proxcenter-xapi-${jobId}-`, "").replace(/\.sock$/, ""), c[2].initialRateMbps ?? 0])
+    const rateOf = (prefix: string) => calls.filter(([tag]) => String(tag).startsWith(prefix)).map(([, r]) => r)
+    expect(rateOf("full-")).toEqual([30])
+    expect(rateOf("delta-1-")).toEqual([30])
+    expect(rateOf("cutover-")).toEqual([0])
+    expect(rateOf("vrfy-").every(r => r === 0)).toBe(true)
+    // every governor started was stopped
+    const started = events.filter(e => e.startsWith("start ")).map(e => e.slice(6))
+    expect(started.length).toBeGreaterThan(0)
+    expect(events.filter(e => e.startsWith("stop ")).map(e => e.slice(5))).toEqual(started)
   })
 })
 
@@ -830,6 +917,19 @@ describe("runXcpngWarmMigration failure cleanup", () => {
     expect(hasLog("Kept target volume DatastoreVM:vm-900-disk-0: it holds a completed copy")).toBe(true)
     expect(pveSetVmConfig).not.toHaveBeenCalled()
     expect(xapiLogout).toHaveBeenCalledTimes(1)
+  })
+
+  it("frees the completed copy when the operator cancelled with the target removed", { timeout: 20000 }, async () => {
+    const jobId = "xcp-it-cancel-remove"
+    changedBlocks = [SMALL_DELTA, SMALL_DELTA, SMALL_DELTA]
+    hooks.onLog = msg => { if (msg.startsWith("Delta pass 1:")) { requestCancelRemovesTarget(jobId); cancelWarmMigrationJob(jobId) } }
+
+    const err = await runToEnd(jobId, makeConfig())
+
+    expect(err?.message).toBe("Migration cancelled")
+    expect(sshCommands).toContain("pvesm free 'DatastoreVM:vm-900-disk-0' 2>/dev/null")
+    expect(hasLog("Kept target volume")).toBe(false)
+    expect(hasLog("Removed target volume DatastoreVM:vm-900-disk-0, as asked when cancelling")).toBe(true)
   })
 
   it("names the snapshots it could not remove instead of failing silently", { timeout: 20000 }, async () => {

@@ -10,6 +10,7 @@ import { useHostsByConnection } from '@/hooks/useHosts'
 import { OPEN_BULK_BATCH_EVENT, type OpenBulkBatchDetail } from '@/lib/migration/bulkBatchOpen'
 import { emptyMigrationStats, sumMigrationStats, type MigrationStats } from '@/lib/migration/migration-stats'
 import { bulkBatchFromPayload, bulkLogOffsets, bulkRowsFromBatch, bulkSourceTypeLabel, fetchActiveBulkBatch, fetchBulkBatch, isBulkBatchFinished, shouldTrackBulkJob, type BatchPayload, type BulkMigBatch, type BulkMigJobRow } from './bulkJobList'
+import { migrationStepText } from '@/lib/tasks/activeMigrations'
 import { mergeJobLogs } from '@/lib/migration/jobLogs'
 import { useFavorites } from './hooks/useFavorites'
 import { hypervDiskPathsFromScan, useMigrationOptions } from './hooks/useMigrationOptions'
@@ -99,6 +100,7 @@ import BackupJobsPanel from './BackupJobsPanel'
 import RollingUpdateWizard from '@/components/RollingUpdateWizard'
 import { useLicense, Features } from '@/contexts/LicenseContext'
 import { useToast } from '@/contexts/ToastContext'
+import { useOpenMigrationJob } from './hooks/useOpenMigrationJob'
 import { requireOk } from '@/lib/api/fetchJsonSafe'
 import { useTaskTracker } from '@/hooks/useTaskTracker'
 import type { Status, InventorySelection, Kpi, KV, UtilMetric, DetailsPayload, RrdTimeframe, SeriesPoint, ActiveDialog } from './types'
@@ -123,6 +125,7 @@ import BackupDashboard from './BackupDashboard'
 import MigrationDashboard from './MigrationDashboard'
 import { ViewMode, AllVmItem, HostItem, PoolItem, PoolActions, TagItem, NodeIcon, ClusterIcon, StatusIcon } from './InventoryTree'
 import { isVdcPool } from './components/poolMembers'
+import CancelMigrationDialog from './components/CancelMigrationDialog'
 import NetworkDetailPanel from './components/NetworkDetailPanel'
 import TenantVnetDetailPanel from './TenantVnetDetailPanel'
 import TagManager from './components/TagManager'
@@ -130,6 +133,8 @@ import EntityTagManager from './components/EntityTagManager'
 import VmActions from './components/VmActions'
 import NodeActions from './components/NodeActions'
 import WarmCutoverButton, { canRequestCutover, isAwaitingOperator } from './components/WarmCutoverButton'
+import SyncIntervalButton from './components/SyncIntervalButton'
+import CopyRateButton from './components/CopyRateButton'
 import MigrationLogLines from './components/MigrationLogLines'
 import LiveLogBox from '@/components/ui/LiveLogBox'
 import { migrationLogText } from './migrationLogText'
@@ -443,10 +448,12 @@ export default function InventoryDetails({
   const [cancelMigBusy, setCancelMigBusy] = useState(false)
   // Resolves true once the orchestrator accepted the cancel. A refusal is
   // shown, and the confirmation stays open: the migration is still running.
-  const cancelVmMigration = async (jobId: string): Promise<boolean> => {
+  const cancelVmMigration = async (jobId: string, removeTarget = false): Promise<boolean> => {
     setCancelMigBusy(true)
     try {
-      const d = await requireOk<{ data?: any }>(`/api/v1/migrations/${jobId}/cancel`, { method: 'POST' })
+      const d = await requireOk<{ data?: any }>(`/api/v1/migrations/${jobId}/cancel`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ removeTarget }),
+      })
       if (d?.data) setVmMigJob(d.data)
 
       return true
@@ -485,9 +492,11 @@ export default function InventoryDetails({
     migTransferMode, setMigTransferMode,
     migConvertToQcow2, setMigConvertToQcow2,
     migManualCutover, setMigManualCutover,
+    migSyncIntervalSec, setMigSyncIntervalSec,
     migConvertGuest, setMigConvertGuest, migEfiPreEnrolledKeys, setMigEfiPreEnrolledKeys,
     migDowntimeBudget, setMigDowntimeBudget,
     migZeroRateLimit, setMigZeroRateLimit,
+    migCopyRateLimit, setMigCopyRateLimit,
     migBulkConcurrency, setMigBulkConcurrency,
     migCopyVmk, setMigCopyVmk,
     migCpuType, setMigCpuType,
@@ -1096,7 +1105,8 @@ export default function InventoryDetails({
   updatePCTaskRef.current = updatePCTask
 
   // Poll migration job status + sync to TasksBar.
-  // Prefer j.currentStep when available — processV2vOutput updates it with
+  // Prefer the step of the run when available (migrationStepText: translated,
+  // "Waiting for cutover" while it waits, delta_19 read as "Delta sync"); processV2vOutput updates it with
   // the live virt-v2v phase name ("Inspecting the source", "Copying disk 1/2",
   // etc.) which is far more descriptive than the pipeline-level j.status
   // ("transferring"). The status-based fallback is kept for non-virt-v2v steps
@@ -1124,7 +1134,7 @@ export default function InventoryDetails({
             : j.status
           updatePCTaskRef.current(taskId, {
             progress: j.progress || 0,
-            detail: j.currentStep || stepFallback,
+            detail: migrationStepText(k => t(k as any), { status: j.status, currentStep: j.currentStep ?? null, cutoverMode: j.config?.cutoverMode ?? null, projectedDowntimeSec: j.projectedDowntimeSec ?? null }) || stepFallback,
             status: j.status === 'completed' ? 'done' : j.status === 'failed' || j.status === 'cancelled' ? 'error' : 'running',
             ...(j.status === 'failed' ? { error: j.error } : {}),
           })
@@ -1176,7 +1186,7 @@ export default function InventoryDetails({
       else if (j.status === 'failed' || j.status === 'cancelled') taskStatus = 'error'
       updatePCTaskRef.current(`migration-${j.id}`, {
         progress: j.progress || 0,
-        detail: j.currentStep || stepFallback,
+        detail: migrationStepText(k => t(k as any), { status: j.status, currentStep: j.currentStep ?? null, cutoverMode: j.cutoverMode ?? null, projectedDowntimeSec: j.projectedDowntimeSec ?? null }) || stepFallback,
         status: taskStatus,
         ...(j.status === 'failed' ? { error: j.error || undefined } : {}),
       })
@@ -1262,6 +1272,21 @@ export default function InventoryDetails({
     // instead of waiting for the next tick.
   }, [selection, migJobId])
 
+  // A single migration asked for from the task bar or the running-tasks menu,
+  // or named in the address: reopen its migrate dialog from the run's record
+  // (lib/migration/migrationJobOpen), whichever tab started it. A run named in
+  // the address waits for the page to have selected what the address selects.
+  const [addressSelection] = useState(() => {
+    if (typeof window === 'undefined') return null
+    const q = new URLSearchParams(window.location.search)
+    return q.get('selectType') ? { type: q.get('selectType'), id: q.get('selectId') } : null
+  })
+  const { askedInAddress: migrationAskedInAddress } = useOpenMigrationJob({
+    onOpen: vm => setEsxiMigrateVm(vm),
+    onError: message => toast.error(t('inventoryPage.esxiMigration.reopenFailed', { error: message })),
+    ready: !addressSelection || (selection?.type === addressSelection.type && selection?.id === addressSelection.id),
+  })
+
   // A bulk migration runs on the server (roadmap#53): opening its source host
   // page reopens the follow-up of a batch still in flight there, even after the
   // tab that launched it was closed. Skipped while a batch is already loaded.
@@ -1272,6 +1297,9 @@ export default function InventoryDetails({
     if (selection?.type !== 'ext' || bulkMigBatchRef.current) return
     let stale = false
     const wanted = new URLSearchParams(window.location.search).get('openBatch')
+    // A single run named in the address: its dialog opens, not the batch in
+    // flight on that host.
+    if (!wanted && migrationAskedInAddress()) return
     const load = wanted
       ? fetchBulkBatch(wanted).then(snap => {
         if (!snap || stale || bulkMigBatchRef.current) return false
@@ -4556,6 +4584,8 @@ return vm?.isCluster ?? false
                                 </Typography>
                               )}
                             </Box>
+                            <SyncIntervalButton job={vmMigJob} />
+                            <CopyRateButton job={vmMigJob} />
                             <WarmCutoverButton job={vmMigJob} />
                             <ForcePowerOffButton job={vmMigJob} />
                             <RootChoiceButton job={vmMigJob} />
@@ -4822,48 +4852,18 @@ return vm?.isCluster ?? false
                   </DialogContent>
                 </Dialog>
 
-                {/* Same warning the migrate dialog shows: a target volume holding a
-                    completed copy survives the cancel, so the operator has to know
-                    before firing it. */}
-                <Dialog
+                {/* Same confirmation as the migrate dialog: what was copied on
+                    the target stays or goes with the cancel, the operator's choice. */}
+                <CancelMigrationDialog
                   open={!!cancelMigConfirm}
+                  job={vmMigJob}
+                  busy={cancelMigBusy}
                   onClose={() => setCancelMigConfirm(null)}
-                  maxWidth="xs"
-                  fullWidth
-                >
-                  <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, color: 'error.main' }}>
-                    <i className="ri-error-warning-line" style={{ fontSize: 20 }} />
-                    {t('inventoryPage.esxiMigration.cancelMigrationConfirmTitle')}
-                  </DialogTitle>
-                  <DialogContent>
-                    <Typography sx={{ mb: 1.5 }}>
-                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmStop')}
-                    </Typography>
-                    <Alert severity="warning" sx={{ mb: 1.5 }}>
-                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmVolumesKept')}
-                    </Alert>
-                    <Typography variant="body2" color="text.secondary">
-                      {t('inventoryPage.esxiMigration.cancelMigrationConfirmSourceUntouched')}
-                    </Typography>
-                  </DialogContent>
-                  <DialogActions sx={{ px: 3, pb: 2 }}>
-                    <Button onClick={() => setCancelMigConfirm(null)} color="inherit">
-                      {t('inventoryPage.esxiMigration.keepMigrating')}
-                    </Button>
-                    <Button
-                      variant="contained"
-                      color="error"
-                      disabled={cancelMigBusy}
-                      startIcon={cancelMigBusy ? <CircularProgress size={16} /> : undefined}
-                      onClick={async () => {
-                        if (!cancelMigConfirm) return
-                        if (await cancelVmMigration(cancelMigConfirm)) setCancelMigConfirm(null)
-                      }}
-                    >
-                      {t('inventoryPage.esxiMigration.cancelMigration')}
-                    </Button>
-                  </DialogActions>
-                </Dialog>
+                  onConfirm={async removeTarget => {
+                    if (!cancelMigConfirm) return
+                    if (await cancelVmMigration(cancelMigConfirm, removeTarget)) setCancelMigConfirm(null)
+                  }}
+                />
               </Stack>
             )
           })()}
@@ -5042,10 +5042,14 @@ return vm?.isCluster ?? false
         migEfiPreEnrolledKeys={migEfiPreEnrolledKeys}
         setMigEfiPreEnrolledKeys={setMigEfiPreEnrolledKeys}
         setMigManualCutover={setMigManualCutover}
+        migSyncIntervalSec={migSyncIntervalSec}
+        setMigSyncIntervalSec={setMigSyncIntervalSec}
         migDowntimeBudget={migDowntimeBudget}
         setMigDowntimeBudget={setMigDowntimeBudget}
         migZeroRateLimit={migZeroRateLimit}
         setMigZeroRateLimit={setMigZeroRateLimit}
+        migCopyRateLimit={migCopyRateLimit}
+        setMigCopyRateLimit={setMigCopyRateLimit}
         migBulkConcurrency={migBulkConcurrency}
         setMigBulkConcurrency={setMigBulkConcurrency}
         migCopyVmk={migCopyVmk}

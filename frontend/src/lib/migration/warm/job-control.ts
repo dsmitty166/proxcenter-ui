@@ -10,6 +10,11 @@ const cutoverRequests = new Set<string>()
 // for. Set when the guest refuses to shut down and the operator chooses to stop
 // the source hard rather than wait the deadline out (#614).
 const forcePowerOffRequests = new Set<string>()
+// A test of the waiting copy asked for, and a request to stop it (migration-test.ts).
+const testRequests = new Set<string>()
+const testStopRequests = new Set<string>()
+// The operator cancelled and asked to remove the copy on the target.
+const cancelRemovesTargetJobs = new Set<string>()
 const jobPrisma = new Map<string, any>()
 // At most one warm job per source VM in-flight. Concurrent warm runs against the
 // same VM would interleave snapshots and dd-seek writes (target corruption), so a
@@ -29,10 +34,21 @@ export async function registerJob(jobId: string, prisma: any): Promise<void> {
   jobPrisma.set(jobId, prisma)
   cutoverRequests.delete(jobId)
   forcePowerOffRequests.delete(jobId)
+  clearWarmTest(jobId)
+  cancelRemovesTargetJobs.delete(jobId)
   await startOperatorSignalWatch(prisma, jobId, signals => {
+    // Before the cancel itself: the cleanup the cancel triggers reads it.
+    if (signals.cancelRemovesTarget) cancelRemovesTargetJobs.add(jobId)
     if (signals.cancelled) cancelledJobs.add(jobId)
     if (signals.cutover) cutoverRequests.add(jobId)
     if (signals.forcePowerOff) forcePowerOffRequests.add(jobId)
+    // Both ways, unlike the one-shot signals above: the engine clears the row
+    // when a test ends, and a read in flight across that clear must not keep a
+    // request (or a stop) alive for the next test.
+    if (signals.test) testRequests.add(jobId)
+    else testRequests.delete(jobId)
+    if (signals.testStop) testStopRequests.add(jobId)
+    else testStopRequests.delete(jobId)
   })
 }
 
@@ -41,8 +57,10 @@ export function unregisterJob(jobId: string): void {
   stopOperatorSignalWatch(jobId)
   jobPrisma.delete(jobId)
   cancelledJobs.delete(jobId)
+  cancelRemovesTargetJobs.delete(jobId)
   cutoverRequests.delete(jobId)
   forcePowerOffRequests.delete(jobId)
+  clearWarmTest(jobId)
 }
 
 /** Claim the per-source-VM lock; false when another warm run already holds it. */
@@ -57,6 +75,10 @@ export function releaseVmLock(vmKey: string): void { activeWarmVms.delete(vmKey)
 /** Cooperative cancel signal for a warm job (called by the cancel route). */
 export function cancelWarmMigrationJob(jobId: string) { cancelledJobs.add(jobId) }
 export function isCancelled(jobId: string): boolean { return cancelledJobs.has(jobId) }
+/** The cancel to come also removes the copy on the target (called by the cancel route, before the cancel). */
+export function requestCancelRemovesTarget(jobId: string) { cancelRemovesTargetJobs.add(jobId) }
+/** The job was cancelled, and the operator asked to remove what was copied on the target. */
+export function cancelRemovesTarget(jobId: string): boolean { return cancelledJobs.has(jobId) && cancelRemovesTargetJobs.has(jobId) }
 
 /** Cooperative "cutover now" signal for a warm job (called by the cutover route). */
 export function requestWarmCutover(jobId: string) { cutoverRequests.add(jobId) }
@@ -66,18 +88,43 @@ export function requestWarmForcePowerOff(jobId: string) { forcePowerOffRequests.
 
 export function isForcePowerOffRequested(jobId: string): boolean { return forcePowerOffRequests.has(jobId) }
 
+/** Operator asked the waiting migration to boot a test VM (called by the test route). */
+export function requestWarmTest(jobId: string) { testRequests.add(jobId) }
+export function isTestRequested(jobId: string): boolean { return testRequests.has(jobId) }
+/** Operator asked the running test to stop. */
+export function requestWarmTestStop(jobId: string) { testStopRequests.add(jobId) }
+export function isTestStopRequested(jobId: string): boolean { return testStopRequests.has(jobId) }
+/**
+ * Forget both test signals once a test ended. The engine clears the row
+ * first: the mirror would otherwise put them back on its next read.
+ */
+export function clearWarmTest(jobId: string) {
+  testRequests.delete(jobId)
+  testStopRequests.delete(jobId)
+}
+
 /** Test seam, mirrors __isCutoverRequestedForTest. */
 export function __isForcePowerOffRequestedForTest(jobId: string): boolean { return isForcePowerOffRequested(jobId) }
 export function isCutoverRequested(jobId: string): boolean { return cutoverRequests.has(jobId) }
 /** @internal test hook */
 export function __isCutoverRequestedForTest(jobId: string): boolean { return isCutoverRequested(jobId) }
 
+/**
+ * Move a job to a status. The write that ends a run (completed, failed,
+ * cancelled) always lands. A step of a run still working does not land on a
+ * row the operator cancelled meanwhile: the cancel route writes the row, the
+ * pipeline only reads it on the next poll of its signals, and a progress write
+ * in between used to put the migration back to "delta_sync", so it kept
+ * syncing behind a task shown as stopped until a second cancel got through.
+ */
 export async function updateJob(id: string, status: WarmStatus, extra: Record<string, any> = {}) {
   const prisma = jobPrisma.get(id)
-  await prisma.migrationJob.update({
-    where: { id },
-    data: { status, currentStep: status, ...(status === "completed" ? { completedAt: new Date() } : {}), ...extra },
-  })
+  const data = { status, currentStep: status, ...(status === "completed" ? { completedAt: new Date() } : {}), ...extra }
+  if ((TERMINAL_STATUSES as readonly string[]).includes(status)) {
+    await prisma.migrationJob.update({ where: { id }, data })
+    return
+  }
+  await prisma.migrationJob.updateMany({ where: { id, status: { not: "cancelled" } }, data })
 }
 
 /**
@@ -95,6 +142,17 @@ export async function updateJobLive(id: string, status: WarmStatus, extra: Recor
 }
 
 /**
+ * Write fields of a job that is still running without touching its status or
+ * its step: a figure the engine derives on the side (the suggested sync
+ * interval) must not move what the follow-up shows. Scoped to a non-terminal
+ * status like updateJobLive, so it never writes on a job that has ended.
+ */
+export async function updateJobFields(id: string, data: Record<string, any>) {
+  const prisma = jobPrisma.get(id)
+  await prisma.migrationJob.updateMany({ where: { id, status: { notIn: [...TERMINAL_STATUSES] } }, data })
+}
+
+/**
  * The job's persisted config as it is NOW, not as the pipeline received it:
  * the cutover route writes the operator's guest-conversion choice into it
  * (#1000), from whichever module instance served the click.
@@ -104,6 +162,24 @@ export async function readJobConfig(id: string): Promise<Record<string, any>> {
   const job = await prisma?.migrationJob.findUnique({ where: { id }, select: { config: true } })
   const config = job?.config
   return config && typeof config === "object" && !Array.isArray(config) ? config as Record<string, any> : {}
+}
+
+/**
+ * Write what a test of the waiting copy reports (migration-test.ts), whatever
+ * the job's status: a test ended by a cancellation still has to say so on a
+ * row the cancel route already made terminal. Only test fields go through
+ * here, never the status.
+ */
+export async function updateJobTestFields(id: string, data: { testState?: unknown; testRequest?: null; testStopRequestedAt?: null }) {
+  const prisma = jobPrisma.get(id)
+  await prisma.migrationJob.updateMany({ where: { id }, data })
+}
+
+/** The test the operator asked for, as the route wrote it on the row (migration-test-state.ts parses it). */
+export async function readJobTestRequest(id: string): Promise<unknown> {
+  const prisma = jobPrisma.get(id)
+  const job = await prisma?.migrationJob.findUnique({ where: { id }, select: { testRequest: true } })
+  return job?.testRequest ?? null
 }
 
 export async function appendLog(id: string, msg: string, level: LogEntry["level"] = "info", extra: Partial<LogEntry> = {}) {
@@ -126,17 +202,12 @@ export async function appendStep(id: string, step: WarmLogStep, title: string) {
 const OPERATOR_GATE_TIMEOUT_MS = 2 * 60 * 60 * 1000 // 2h safety cap
 
 /**
- * Pacing between two delta passes of a manual hold. A converged source yields
- * empty passes in seconds; without this the hold would snapshot and consolidate
- * on vCenter in a tight loop for its whole duration, which is exactly the churn
- * that broke a 3 TB run (#678). Deliberately not configurable: it only changes
- * how fresh the projection is, and a minute is fresh enough to decide on.
- */
-export const HOLD_PASS_INTERVAL_MS = 60 * 1000
-
-/**
  * Wait between two hold passes, in slices, so the operator's cutover request is
- * picked up within a second instead of after the full interval. Returns false
+ * picked up within a second instead of after the full interval. A converged
+ * source yields empty passes in seconds; without this pause the hold would
+ * snapshot and consolidate on vCenter in a tight loop for its whole duration,
+ * which is exactly the churn that broke a 3 TB run (#678). How long the pause
+ * lasts is an operator setting (./sync-interval), applied by ./hold-wait. Returns false
  * when a cutover was requested (the caller stops replicating and switches over),
  * true when the wait ran to the end. Throws on cancellation, like every other
  * wait in this pipeline.

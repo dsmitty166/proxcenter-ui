@@ -55,8 +55,10 @@ import SudoCheckLines, { NotDeployedLine, profilesAbsentEverywhere, uniformSudoC
 import { useLicense, Features } from '@/contexts/LicenseContext'
 import { isZeroRateLimitValid, ZERO_RATE_LIMIT_MAX_MBPS } from '@/lib/migration/warm/zero-rate'
 import ZeroRateSlider from '@/components/migration/ZeroRateSlider'
+import CopyRateLimitField from '@/components/migration/CopyRateLimitField'
 import { DEFAULT_INTEGRITY_SETTINGS, INTEGRITY_REGION_COUNT_MAX, INTEGRITY_REGION_SIZE_MIB_MAX, estimateIntegritySecondsPerDisk, integritySettingsFromConnection } from '@/lib/migration/integrity-settings'
 import { MIGRATION_LIMIT_MAX, MIGRATION_PARALLEL_DEFAULT, MIGRATION_PER_NODE_DEFAULT, MIGRATION_PER_SOURCE_HOST_DEFAULT } from '@/lib/migration/migration-limits'
+import { SYNC_INTERVAL_DEFAULT_SEC, SYNC_INTERVAL_STEPS_SEC, formatSyncInterval, syncIntervalStepIndex } from '@/lib/migration/warm/sync-interval'
 
 export type ConnectionFormData = {
   name: string
@@ -99,6 +101,9 @@ export type ConnectionFormData = {
   migrationMaxParallel: number
   migrationMaxPerNode: number
   migrationMaxPerSourceHost: number
+  /** Seconds between two syncs of a warm migration waiting for a manual cutover (VMware, XCP-ng sources). */
+  migrationSyncIntervalSec: number
+  migrationCopyRateLimitPerHostMBps: number
   // Provider-only, create mode: own the connection by an MSP tenant ('' = pool)
   ownerTenantId: string
 }
@@ -155,6 +160,8 @@ const defaultFormData: ConnectionFormData = {
   migrationMaxParallel: MIGRATION_PARALLEL_DEFAULT,
   migrationMaxPerNode: MIGRATION_PER_NODE_DEFAULT,
   migrationMaxPerSourceHost: MIGRATION_PER_SOURCE_HOST_DEFAULT,
+  migrationSyncIntervalSec: SYNC_INTERVAL_DEFAULT_SEC,
+  migrationCopyRateLimitPerHostMBps: 0,
   ownerTenantId: '',
 }
 
@@ -309,6 +316,8 @@ export default function ConnectionDialog({
           migrationMaxParallel: (initialData as any).migrationMaxParallel ?? MIGRATION_PARALLEL_DEFAULT,
           migrationMaxPerNode: (initialData as any).migrationMaxPerNode ?? MIGRATION_PER_NODE_DEFAULT,
           migrationMaxPerSourceHost: (initialData as any).migrationMaxPerSourceHost ?? MIGRATION_PER_SOURCE_HOST_DEFAULT,
+          migrationSyncIntervalSec: (initialData as any).migrationSyncIntervalSec ?? SYNC_INTERVAL_DEFAULT_SEC,
+          migrationCopyRateLimitPerHostMBps: (initialData as any).migrationCopyRateLimitPerHostMBps ?? 0,
           subType: editSubType,
           // External hypervisors keep "user:password" encrypted; the list payload
           // hands the user back as apiUser (never the password). Without it the
@@ -669,7 +678,10 @@ export default function ConnectionDialog({
   // source hypervisor exists to migrate from.
   // A VMware source gets the tab too, for its per-host limit of bulk
   // migrations (ui#1332).
-  const showMigrationsTab = migrationAvailable && ((type === 'pve' && migrationSourcesConfigured) || isVmware)
+  // XCP-ng has one migration setting, the sync interval of a warm hold.
+  // An XCP-ng pool reached through Xen Orchestra only migrates offline: it has
+  // no warm hold, so nothing to set here.
+  const showMigrationsTab = migrationAvailable && ((type === 'pve' && migrationSourcesConfigured) || isVmware || (isXcpng && !isXcpngXo))
   const showSshTab = !isPbs && !isXcpng && !isHyperv && !isNutanix && !(isVmware && form.subType === 'vcenter')
   const visibleTabs: { id: ConnectionTabId; label: string; icon: string }[] = [
     { id: 'general', label: t('settings.connectionTabGeneral'), icon: 'ri-settings-3-line' },
@@ -1586,7 +1598,7 @@ export default function ConnectionDialog({
         </Box>
 
         <Box role="tabpanel" hidden={currentTab !== 'migrations'} sx={{ pt: 1 }}>
-        {showMigrationsTab && (
+        {showMigrationsTab && !isXcpng && (
           <>
             {/* Bulk migration limits (ui#1332): how many migrations run at once
                 into this cluster and into one of its nodes, or out of one ESXi
@@ -1615,6 +1627,48 @@ export default function ConnectionDialog({
               ))}
               <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
                 {t(isVmware ? 'settings.migrationLimitsSourceCaption' : 'settings.migrationLimitsTargetCaption')}
+              </Typography>
+            </Box>
+          </>
+        )}
+        {showMigrationsTab && (isVmware || isXcpng) && (
+          <>
+            {isVmware && <Divider sx={{ my: 2.5 }} />}
+            {/* Warm migrations OUT of this source: how often a migration that
+                waits for a manual cutover syncs again. Each sync snapshots the
+                source VM, so this is what a waiting wave costs the platform. */}
+            <SectionTitle icon="ri-time-line" title={t('settings.migrationSyncIntervalTitle')} optional={t('common.optional')} info={t('settings.migrationSyncIntervalInfo')} />
+            <Box sx={{ mt: 1, mb: 1 }}>
+              <Typography variant="body2">
+                {t('settings.migrationSyncInterval')} <Box component="span" sx={{ fontWeight: 600 }} data-testid="connection-migrationSyncIntervalSec-value">{formatSyncInterval(SYNC_INTERVAL_STEPS_SEC[syncIntervalStepIndex(form.migrationSyncIntervalSec)])}</Box>
+              </Typography>
+              <Slider
+                sx={{ mx: 4, width: 'calc(100% - 64px)' }}
+                value={syncIntervalStepIndex(form.migrationSyncIntervalSec)}
+                min={0}
+                max={SYNC_INTERVAL_STEPS_SEC.length - 1}
+                step={1}
+                marks={[0, 4, 6, 8, 11].map(i => ({ value: i, label: formatSyncInterval(SYNC_INTERVAL_STEPS_SEC[i]) }))}
+                onChange={(_e, v) => handleChange('migrationSyncIntervalSec', SYNC_INTERVAL_STEPS_SEC[v as number])}
+                slotProps={{ input: { 'aria-label': t('settings.migrationSyncInterval'), 'data-testid': 'connection-migrationSyncIntervalSec' } as any }}
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                {t('settings.migrationSyncIntervalCaption')}
+              </Typography>
+            </Box>
+            {/* Warm copies OUT of this source: cap on what the copies reading
+                from one of its hosts take together, whatever their batch. */}
+            <Divider sx={{ my: 2.5 }} />
+            <SectionTitle icon="ri-speed-line" title={t('copyRate.perHostTitle')} optional={t('common.optional')} info={t('copyRate.perHostInfo')} />
+            <Box sx={{ mt: 1, mb: 1 }}>
+              <CopyRateLimitField
+                label={t('copyRate.perHost')}
+                value={form.migrationCopyRateLimitPerHostMBps}
+                onChange={v => handleChange('migrationCopyRateLimitPerHostMBps', v)}
+                testId="connection-copy-rate-per-host"
+              />
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                {t('copyRate.perHostCaption')}
               </Typography>
             </Box>
           </>

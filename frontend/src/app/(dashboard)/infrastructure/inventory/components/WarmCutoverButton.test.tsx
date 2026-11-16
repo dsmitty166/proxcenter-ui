@@ -113,6 +113,13 @@ describe('WarmCutoverButton', () => {
     expect(calls).toEqual([])
   })
 
+  it('is greyed out, with the reason, while a test of the copy runs', () => {
+    renderWithProviders(<WarmCutoverButton job={{ ...hold, testState: { phase: 'running', testVmid: 9001 } }} />)
+    const button = screen.getByRole('button', { name: CUTOVER_LABEL })
+    expect(button).toBeDisabled()
+    expect(screen.getByLabelText('Stop the running test before the cutover')).toBeInTheDocument()
+  })
+
   it('does not tell a manual hold that it fails to converge', () => {
     // The hold is waiting on purpose. The warning belongs to the automatic gate,
     // where the projection really did stay above the budget.
@@ -212,7 +219,7 @@ describe('guest conversion at cutover (#1000)', () => {
     fireEvent.click(screen.getByRole('button', { name: CUTOVER_LABEL }))
     const box = await screen.findByTestId('cutover-convert-guest') as HTMLInputElement
     expect(box.checked).toBe(true)
-    expect(screen.getByText(/Adds about 60 s to the downtime/)).toBeInTheDocument()
+    expect(screen.getByText(/Adds about 100 s to the downtime/)).toBeInTheDocument()
 
     fireEvent.click(box)
     expect(screen.getByText(/No conversion: the VM boots on the hardware it supports/)).toBeInTheDocument()

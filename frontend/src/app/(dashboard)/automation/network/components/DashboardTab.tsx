@@ -1,18 +1,36 @@
 'use client'
 
-import { useState } from 'react'
-import { useTranslations } from 'next-intl'
-
-import {
-  Avatar, Box, Button, Card, CardContent, Chip, CircularProgress,
-  Collapse, Divider, IconButton, LinearProgress, Paper, Skeleton,
-  Stack, Tooltip, Typography, useTheme, alpha
-} from '@mui/material'
+import { useMemo, useState } from 'react'
+import { Box } from '@mui/material'
 
 import * as firewallAPI from '@/lib/api/firewall'
-import { VMFirewallInfo } from '@/hooks/useVMFirewallRules'
-import { PVE_DEFAULT_POLICY_IN, PVE_DEFAULT_POLICY_OUT } from '@/lib/firewall/pveDefaults'
-import DeploymentWizard from './DeploymentWizard'
+import { useVMFirewallCoverage, type FirewallCoverage } from '@/hooks/useZeroTrust'
+import { useMicrosegPolicy } from '@/lib/microseg/useMicroseg'
+import { useMicrosegSuggestions } from '@/lib/microseg/useMicrosegLists'
+import type { ListSuggestionsParams } from '@/lib/microseg/api'
+import type { MicrosegPolicy, MicrosegSuggestion, MicrosegZone } from '@/lib/microseg/types'
+
+import { topConversations } from './dashboardConversations'
+import type { BlockPhase } from './dashboardModel'
+import {
+  GROUP_BYS, POSTURE_SUGGESTIONS_LIMIT, isZoneGrouping, postureDistribution, postureGuests, postureTraffic, topServices, type GroupBy,
+} from './dashboardPosture'
+import FirewallLoadAlert from './FirewallLoadAlert'
+import { TopServices, TrafficDistribution } from './ObservedTraffic'
+import TopConversations from './TopConversations'
+import TrafficByZone from './TrafficByZone'
+import TrafficTimeline from './TrafficTimeline'
+import { postureVolume, type TimelineRange, type TimelineVerdict } from './postureTimeline'
+import { useTimelineRange } from './useTimelineRange'
+import { useTrafficTimeline } from './useTrafficTimeline'
+import { useStoredChoice } from './microseg/useStoredChoice'
+import { usePostureVolume } from './usePostureVolume'
+import type { MicrosegSubTab, ObservationFocus } from './microseg/microsegTabTypes'
+import { useZoneGuests } from './microseg/useZoneGuests'
+import type { PolicyGuest } from './microseg/zoneModel'
+
+/** The guest filter Firewalling > VMs can open with. */
+export type GuestFilter = 'unprotected'
 
 interface DashboardTabProps {
   // Data
@@ -21,378 +39,193 @@ interface DashboardTabProps {
   clusterRules: firewallAPI.FirewallRule[]
   aliases: firewallAPI.Alias[]
   ipsets: firewallAPI.IPSet[]
-  vmFirewallData: VMFirewallInfo[]
-  loadingVMRules: boolean
   firewallMode: firewallAPI.FirewallMode
   currentOptions: firewallAPI.ClusterOptions | firewallAPI.NodeOptions | null
   selectedConnection: string
+  /** Name of the selected connection (the Posture layout does not show it). */
+  connectionName?: string
   totalRules: number
   totalIPSetEntries: number
   nodesList: string[]
+  /** What failed on the last load of the firewall data, null when it all loaded. */
+  loadError?: string | null
+  /** The firewall data is still loading: nothing can be said about the cluster yet. */
+  loading?: boolean
   // Handlers
   reload: () => void
   // Navigation
   onNavigateTab: (tab: number) => void
   onNavigateRulesSubTab: (subTab: number) => void
+  /** Firewalling > VMs, filtered on the guests without firewall when asked. */
+  onOpenGuests?: (filter?: GuestFilter) => void
+  /** The Micro-segmentation tab, on one of its sub-tabs when asked; the Observation one on a type of flow or a service. */
+  onOpenMicroseg?: (subTab?: MicrosegSubTab, focus?: ObservationFocus) => void
 }
 
-const BreakdownRow = ({ icon, label, points, reason }: {
-  icon: string; label: string; points: number; reason: string
-}) => {
-  const color = points > 0 ? '#22c55e' : 'text.secondary'
+/** The pending observed flows, the same page as the zone map (one SWR key, one read for both). */
+const PENDING_OBSERVED: ListSuggestionsParams = { status: 'pending', limit: POSTURE_SUGGESTIONS_LIMIT }
 
-  return (
-    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, py: 0.75 }}>
-      <Box sx={{ width: 24, textAlign: 'center', opacity: 0.6, fontSize: '0.85rem' }}>
-        <i className={icon} />
-      </Box>
-      <Typography variant="body2" sx={{ fontWeight: 600, minWidth: 100 }}>{label}</Typography>
-      <Box sx={{ flex: 1 }}>
-        <Typography variant="caption" sx={{ color: 'text.secondary' }}>{reason}</Typography>
-      </Box>
-      <Chip
-        size="small"
-        label={points > 0 ? `+${points}` : '0'}
-        sx={{
-          height: 22, minWidth: 44, fontWeight: 700, fontSize: '0.75rem',
-          bgcolor: alpha(points > 0 ? '#22c55e' : '#888', 0.18),
-          color,
-        }}
-      />
-    </Box>
-  )
+/** A block made of micro-segmentation reads: a skeleton until they answered, not available when one failed. */
+function microsegPhase(reads: { data?: unknown; error?: unknown }[]): BlockPhase {
+  if (reads.some(r => !r.data && r.error)) return 'unavailable'
+
+  return reads.every(r => r.data) ? 'ready' : 'loading'
 }
 
+/** The figures of the observed traffic blocks, from the policy, the pending flows and the guests. */
+function usePostureFigures(policy: MicrosegPolicy | undefined, suggestions: MicrosegSuggestion[] | undefined, rows: FirewallCoverage['guests'], listed: PolicyGuest[] | null, groupBy: GroupBy) {
+  return useMemo(() => {
+    const zones = policy?.zones ?? []
+    const tagPrefix = policy?.policy.tag_prefix ?? ''
+    const flows = policy?.flows ?? []
+    const seen = suggestions ?? []
+    const addresses = listed !== null
+    const guests = postureGuests(rows, listed)
+    return {
+      guests,
+      traffic: postureTraffic({ groupBy, zones, tagPrefix, suggestions: seen, guests, addresses }),
+      distribution: postureDistribution({ zones, tagPrefix, flows, suggestions: seen, guests, addresses }),
+      services: topServices(seen, flows),
+      servicesTotal: topServices(seen, flows, Number.POSITIVE_INFINITY).length,
+    }
+  }, [policy, suggestions, rows, listed, groupBy])
+}
+
+const NO_ZONES: MicrosegZone[] = []
+const NO_NAME = (): string | undefined => undefined
+
+/** The guest that carries an address, once the guest list is read (a grouping by VLAN or node asked for it). */
+function useGuestNames(guests: readonly PolicyGuest[] | null): (ip: string) => string | undefined {
+  return useMemo(() => {
+    if (!guests) return NO_NAME
+    const byIp = new Map<string, string>()
+    for (const g of guests) for (const ip of g.ips ?? []) byIp.set(ip, g.name)
+    return (ip: string) => byIp.get(ip)
+  }, [guests])
+}
+/** The grouping of the traffic block, remembered per browser. */
+export const GROUP_BY_KEY = 'proxcenter.microseg.postureGroupBy'
+
+/**
+ * The time charts, on the groups of the donut. The events chart reads the persisted history of the range chosen when
+ * grouped by zone (the only grouping the history carries), the events of the ring otherwise or when the orchestrator
+ * does not serve the history; the Volume tab reads the sFlow bytes when sFlow sees the connection.
+ */
+function useTimelineFigures(
+  connection: string | null, policy: MicrosegPolicy | undefined, posture: ReturnType<typeof usePostureFigures>,
+  groupBy: GroupBy, verdict: TimelineVerdict, addresses: boolean, range: TimelineRange,
+) {
+  const { timeline, answer, rangeLock, now } = useTrafficTimeline({
+    connection, zones: policy?.zones ?? NO_ZONES, slices: posture.traffic.slices, groupBy, verdict, range, guests: posture.guests, addresses,
+  })
+  // The sFlow window moves at each edge of its windows, on the same minute clock.
+  const sflow = usePostureVolume(connection, posture.guests, now, range)
+  const volume = useMemo(() => (sflow.available ? postureVolume({
+    series: sflow.series, groupBy, zones: policy?.zones ?? [], tagPrefix: policy?.policy.tag_prefix ?? '', guests: posture.guests,
+    slices: posture.traffic.slices, range, from: sflow.from, to: sflow.to,
+  }) : null), [sflow.available, sflow.series, sflow.from, sflow.to, range, groupBy, policy, posture])
+  return { timeline, volume, answer, rangeLock }
+}
+
+/**
+ * The "Posture" Dashboard of /automation/network (UA50): the observed traffic per zone (donut, chords and timeline),
+ * its distribution and top services, then the busiest conversations down to the bottom of the page. Its reads: the
+ * coverage route (computed and cached on the server; its guests' nodes, tags and VLANs), the micro-segmentation policy and pending flows
+ * (orchestrator memory), the events ring for the time chart (orchestrator memory, every minute, only when grouped by VLAN or node or when the history route is not served), the persisted history of the flows for the zone grouping (the range chosen, remembered per browser), the sFlow pairs and
+ * time series for its Volume tab (orchestrator and InfluxDB). The guest list (the inventory route, one guest config per guest on Proxmox) is read only once
+ * a grouping by VLAN or node asks for it, shared with the zone map.
+ */
 export default function DashboardTab({
-  vmFirewallData, loadingVMRules, firewallMode, currentOptions,
-  selectedConnection, clusterOptions, clusterRules, nodesList,
-  securityGroups, totalRules,
-  reload, onNavigateTab, onNavigateRulesSubTab
+  selectedConnection, loadError, reload, onNavigateTab, onOpenMicroseg,
 }: DashboardTabProps) {
-  const theme = useTheme()
-  const t = useTranslations()
-  const [deployWizardOpen, setDeployWizardOpen] = useState(false)
-  const [showBreakdown, setShowBreakdown] = useState(false)
+  const [groupBy, setGroupBy] = useStoredChoice<GroupBy>(GROUP_BY_KEY, GROUP_BYS, 'zone')
+  // Once a grouping by VLAN or node asked for the guests, they stay (a zone grouping then tells the unzoned apart).
+  const [guestsWanted, setGuestsWanted] = useState(() => !isZoneGrouping(groupBy))
+  const [verdict, setVerdict] = useState<TimelineVerdict>('all')
+  const [range, setRange] = useTimelineRange()
+  const connection = selectedConnection || null
 
-  // Virgin cluster detection (works for both cluster and standalone — PVE always has cluster-level firewall)
-  const isVirginCluster = clusterOptions?.enable !== 1
-    && clusterRules.length === 0
+  // Read once when the tab shows (this component mounts with it), computed and cached on the server (UA44).
+  const coverageRead = useVMFirewallCoverage(connection)
+  const coverage = coverageRead.data?.computedAt ? coverageRead.data : null
+  const microsegPolicy = useMicrosegPolicy(connection)
+  const pending = useMicrosegSuggestions(connection, PENDING_OBSERVED)
+  const zoneGuests = useZoneGuests(guestsWanted ? connection : null)
 
-  // Compute shared metrics
-  const vmsWithFirewall = vmFirewallData.filter(v => v.firewallEnabled).length
-  const totalVMs = vmFirewallData.length || 1
-  const vmCoverage = (vmsWithFirewall / totalVMs) * 100
-  // Node options carry no policy: a host follows the cluster's, and an unset
-  // policy is PVE's default, not ACCEPT (#1065).
-  const policyIn = clusterOptions?.policy_in || PVE_DEFAULT_POLICY_IN
-  const policyOut = clusterOptions?.policy_out || PVE_DEFAULT_POLICY_OUT
-  const hasStrictPolicy = policyIn === 'DROP' || policyOut === 'DROP'
-  const firewallEnabled = currentOptions?.enable === 1
-  const unprotected = vmFirewallData.filter(v => !v.firewallEnabled).length
+  const policy = microsegPolicy.data
 
-  // Individual score components for breakdown (now out of 100 with 3 components)
-  const scoreFirewall = firewallEnabled ? 30 : 0
-  const scorePolicy = hasStrictPolicy ? 25 : 0
-  const scoreVmCoverage = Math.round(vmCoverage * 0.45)
-  const score = scoreFirewall + scorePolicy + scoreVmCoverage
+  const addresses = guestsWanted && zoneGuests.status === 'ready'
+  const listsPhase = microsegPhase([microsegPolicy, pending])
+  // A grouping by VLAN or node waits for the guests it is made of.
+  const trafficPhase = listsPhase === 'ready' && !isZoneGrouping(groupBy) && zoneGuests.status === 'loading' ? 'loading' : listsPhase
+  const posture = usePostureFigures(policy, pending.data, coverage?.guests, addresses ? zoneGuests.guests : null, groupBy)
+  const { timeline, volume, answer, rangeLock } = useTimelineFigures(connection, policy, posture, groupBy, verdict, addresses, range)
+  const conversations = useMemo(() => topConversations(pending.data ?? []), [pending.data])
+  const guestName = useGuestNames(addresses ? zoneGuests.guests : null)
+  const timelinePhase = microsegPhase([microsegPolicy, answer])
 
-  const scoreColor = score >= 80 ? '#22c55e' : score >= 50 ? '#f59e0b' : '#ef4444'
-  const scoreLabel = score >= 80 ? t('networkPage.excellent') : score >= 50 ? t('networkPage.moderate') : t('networkPage.toImprove')
+  const openMicroseg = (subTab?: MicrosegSubTab, focus?: ObservationFocus) => {
+    if (!onOpenMicroseg) onNavigateTab(6)
+    else if (focus) onOpenMicroseg(subTab, focus)
+    else onOpenMicroseg(subTab)
+  }
+  const changeGroupBy = (next: GroupBy) => {
+    setGroupBy(next)
+    if (!isZoneGrouping(next)) setGuestsWanted(true)
+  }
+
+  if (!selectedConnection) return <Box sx={{ p: 3 }} />
 
   return (
-    <Box sx={{ p: 3 }}>
-      {/* Virgin cluster banner */}
-      {isVirginCluster && selectedConnection && (
-        <Paper sx={{
-          p: 2.5, mb: 3,
-          bgcolor: alpha('#f59e0b', 0.14),
-          border: `1px solid ${alpha('#f59e0b', 0.4)}`,
-          display: 'flex', alignItems: 'center', gap: 2, flexWrap: 'wrap'
-        }}>
-          <Avatar sx={{ width: 40, height: 40, bgcolor: alpha('#f59e0b', 0.22) }}>
-            <i className="ri-shield-flash-line" style={{ fontSize: 20, color: '#f59e0b' }} />
-          </Avatar>
-          <Box sx={{ flex: 1, minWidth: 200 }}>
-            <Typography variant="subtitle2" sx={{ fontWeight: 700, color: '#f59e0b' }}>
-              {t('deployWizard.bannerTitle')}
-            </Typography>
-            <Typography variant="body2" sx={{ color: 'text.secondary', fontSize: 12 }}>
-              {t('deployWizard.bannerDescription')}
-            </Typography>
-          </Box>
-          <Button
-            variant="contained"
-            color="warning"
-            startIcon={<i className="ri-shield-flash-line" />}
-            onClick={() => setDeployWizardOpen(true)}
-            sx={{ flexShrink: 0 }}
-          >
-            {t('deployWizard.bannerButton')}
-          </Button>
-        </Paper>
-      )}
+    <Box data-testid='dashboard' sx={{ p: 3, flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <FirewallLoadAlert error={loadError} onRetry={reload} />
 
-      <DeploymentWizard
-        open={deployWizardOpen}
-        onClose={() => setDeployWizardOpen(false)}
-        selectedConnection={selectedConnection}
-        clusterOptions={clusterOptions}
-        clusterRules={clusterRules}
-        nodesList={nodesList}
-        firewallMode={firewallMode}
-        onComplete={reload}
-      />
-
-      {/* Section 1: Security Posture (hero) */}
-      <Card sx={{
-        background: `linear-gradient(135deg, ${alpha(scoreColor, 0.14)} 0%, ${alpha(theme.palette.background.paper, 0.95)} 50%, ${alpha(scoreColor, 0.08)} 100%)`,
-        border: '1px solid',
-        borderColor: alpha(scoreColor, 0.3),
-        position: 'relative',
-        overflow: 'hidden',
-        mb: 3,
-        '&:hover': { borderColor: alpha(scoreColor, 0.5), boxShadow: `0 8px 32px ${alpha(scoreColor, 0.2)}` },
-      }}>
-        <Box sx={{ position: 'absolute', top: -50, right: -50, width: 200, height: 200, borderRadius: '50%', background: `radial-gradient(circle, ${alpha(scoreColor, 0.15)} 0%, transparent 70%)` }} />
-        <CardContent sx={{ p: 3, position: 'relative' }}>
-          {loadingVMRules ? (
-            <Stack direction={{ xs: 'column', md: 'row' }} spacing={4} alignItems="center">
-              <Skeleton variant="circular" width={140} height={140} />
-              <Box sx={{ flex: 1 }}>
-                <Skeleton variant="text" width="50%" height={36} />
-                <Skeleton variant="text" width="30%" height={28} sx={{ mb: 1 }} />
-                <Skeleton variant="text" width="80%" height={20} />
-                <Skeleton variant="text" width="60%" height={20} />
-              </Box>
-            </Stack>
-          ) : (
-            <>
-              <Stack direction={{ xs: 'column', md: 'row' }} spacing={4} alignItems="center">
-                {/* Gauge */}
-                <Box sx={{ position: 'relative', display: 'inline-flex', flexShrink: 0 }}>
-                  <CircularProgress variant="determinate" value={100} size={140} thickness={3} sx={{ color: alpha(scoreColor, 0.22) }} />
-                  <CircularProgress variant="determinate" value={score} size={140} thickness={3} sx={{ color: scoreColor, position: 'absolute', left: 0, filter: `drop-shadow(0 0 8px ${alpha(scoreColor, 0.4)})` }} />
-                  <Box sx={{ top: 0, left: 0, bottom: 0, right: 0, position: 'absolute', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column' }}>
-                    <Typography variant="h2" fontWeight={800} sx={{ color: scoreColor, lineHeight: 1 }}>{score}</Typography>
-                    <Typography variant="caption" color="text.secondary">/100</Typography>
-                  </Box>
-                </Box>
-
-                {/* Right side */}
-                <Box sx={{ flex: 1 }}>
-                  <Stack direction="row" alignItems="center" spacing={1.5} sx={{ mb: 0.5 }}>
-                    <Typography variant="h5" fontWeight={700}>{t('networkPage.zeroTrustScore')}</Typography>
-                    <Tooltip title={showBreakdown ? t('networkPage.hideDetails') : t('networkPage.showBreakdown')}>
-                      <IconButton size="small" onClick={() => setShowBreakdown(!showBreakdown)} sx={{ ml: 0.5 }}>
-                        <i className={showBreakdown ? 'ri-arrow-up-s-line' : 'ri-information-line'} style={{ fontSize: 18 }} />
-                      </IconButton>
-                    </Tooltip>
-                  </Stack>
-                  <Chip label={scoreLabel} sx={{ bgcolor: alpha(scoreColor, 0.2), color: scoreColor, fontWeight: 700, fontSize: '0.85rem', height: 28, mb: 2 }} />
-
-                  {/* KPIs row */}
-                  <Stack direction="row" spacing={3} flexWrap="wrap" useFlexGap sx={{ mb: 2 }}>
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">{t('networkPage.protectedVms')}</Typography>
-                      <Typography variant="h6" fontWeight={700}>{vmsWithFirewall}<Typography component="span" variant="body2" color="text.secondary"> / {vmFirewallData.length}</Typography></Typography>
-                    </Box>
-                    <Divider orientation="vertical" flexItem />
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">{t('networkPage.totalRulesLabel')}</Typography>
-                      <Typography variant="h6" fontWeight={700}>{totalRules}</Typography>
-                    </Box>
-                    <Divider orientation="vertical" flexItem />
-                    <Box>
-                      <Typography variant="caption" color="text.secondary">{t('firewall.securityGroups')}</Typography>
-                      <Typography variant="h6" fontWeight={700}>{securityGroups.length}</Typography>
-                    </Box>
-                  </Stack>
-
-                  {/* Cluster indicators */}
-                  <Stack spacing={1}>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, p: 1, borderRadius: 1.5, bgcolor: alpha(firewallEnabled ? '#22c55e' : '#ef4444', 0.12) }}>
-                      <i className={firewallEnabled ? "ri-shield-check-line" : "ri-shield-cross-line"} style={{ fontSize: 16, color: firewallEnabled ? '#22c55e' : '#ef4444' }} />
-                      <Typography variant="body2" sx={{ fontWeight: 600, flex: 1 }}>
-                        {t('security.firewall')} {firewallEnabled ? 'ON' : 'OFF'}
-                      </Typography>
-                    </Box>
-                    <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-                      <Chip
-                        icon={<i className="ri-arrow-down-line" style={{ fontSize: 14 }} />}
-                        label={`IN: ${policyIn}`}
-                        size="small"
-                        sx={{
-                          height: 24, fontSize: 11, fontWeight: 700,
-                          bgcolor: alpha(policyIn === 'DROP' ? '#ef4444' : '#22c55e', 0.18),
-                          color: policyIn === 'DROP' ? '#ef4444' : '#22c55e',
-                          '& .MuiChip-icon': { color: 'inherit' }
-                        }}
-                      />
-                      <Chip
-                        icon={<i className="ri-arrow-up-line" style={{ fontSize: 14 }} />}
-                        label={`OUT: ${policyOut}`}
-                        size="small"
-                        sx={{
-                          height: 24, fontSize: 11, fontWeight: 700,
-                          bgcolor: alpha(policyOut === 'DROP' ? '#ef4444' : '#22c55e', 0.18),
-                          color: policyOut === 'DROP' ? '#ef4444' : '#22c55e',
-                          '& .MuiChip-icon': { color: 'inherit' }
-                        }}
-                      />
-                      <Chip
-                        icon={<i className={firewallMode === 'cluster' ? "ri-server-line" : "ri-computer-line"} style={{ fontSize: 14 }} />}
-                        label={firewallMode === 'cluster' ? t('firewall.cluster') : t('firewall.standalone')}
-                        size="small"
-                        sx={{
-                          height: 24, fontSize: 11, fontWeight: 700,
-                          bgcolor: alpha(firewallMode === 'cluster' ? '#3b82f6' : '#f59e0b', 0.18),
-                          color: firewallMode === 'cluster' ? '#3b82f6' : '#f59e0b',
-                          '& .MuiChip-icon': { color: 'inherit' }
-                        }}
-                      />
-                    </Stack>
-                  </Stack>
-                </Box>
-              </Stack>
-
-              {/* Score Breakdown */}
-              <Collapse in={showBreakdown}>
-                <Divider sx={{ my: 2 }} />
-                <Typography variant="subtitle2" fontWeight={700} sx={{ mb: 1 }}>
-                  {t('networkPage.scoreBreakdown')}
-                </Typography>
-                <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' }, gap: 0.5 }}>
-                  <BreakdownRow
-                    icon="ri-shield-check-line"
-                    label={t('networkPage.firewallComponent')}
-                    points={scoreFirewall}
-                    reason={firewallEnabled ? t('networkPage.firewallEnabled') : t('networkPage.firewallDisabled')}
-                  />
-                  <BreakdownRow
-                    icon="ri-arrow-down-line"
-                    label={t('networkPage.policyComponent')}
-                    points={scorePolicy}
-                    reason={hasStrictPolicy ? t('networkPage.policyStrict') : t('networkPage.policyPermissive')}
-                  />
-                  <BreakdownRow
-                    icon="ri-computer-line"
-                    label={t('networkPage.vmCoverageComponent')}
-                    points={scoreVmCoverage}
-                    reason={t('networkPage.coverageReason', { percent: Math.round(vmCoverage) })}
-                  />
-                </Box>
-              </Collapse>
-            </>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Section 2: VM Coverage (simplified) */}
-      <Paper sx={{ p: 3, border: `1px solid ${alpha(theme.palette.divider, 0.1)}`, mb: 3 }}>
-        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-            <Typography variant="subtitle2" sx={{ fontWeight: 700, color: 'text.secondary' }}>
-              {t('networkPage.vmFirewallCoverage')}
-            </Typography>
-            {loadingVMRules && <Chip label={t('networkPage.loading')} size="small" sx={{ height: 20, fontSize: 10 }} />}
-          </Box>
-          <Button size="small" onClick={() => { onNavigateTab(1); onNavigateRulesSubTab(2) }} endIcon={<i className="ri-arrow-right-line" />}>
-            {t('networkPage.viewDetails')}
-          </Button>
+      {/* 1. Observed traffic: by zone and its timeline on the left, its distribution and top services on the right */}
+      <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(12, minmax(0, 1fr))', gap: 2.5, mb: 2.5 }}>
+        <Box sx={{ gridColumn: { xs: 'span 12', lg: 'span 7' }, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+          <TrafficByZone
+            phase={trafficPhase}
+            traffic={posture.traffic}
+            groupBy={groupBy}
+            onGroupBy={changeGroupBy}
+            truncated={(pending.data?.length ?? 0) >= POSTURE_SUGGESTIONS_LIMIT}
+            addresses={addresses}
+            onOpenZone={zoneId => openMicroseg('observation', { zoneId })}
+            onOpenUnknown={() => openMicroseg('observation', { source: 'unknown' })}
+            footer={<TrafficTimeline fill phase={timelinePhase} timeline={timeline} verdict={verdict} onVerdict={setVerdict} volume={volume} volumeSent={groupBy === 'zone'} range={range} onRange={setRange} rangeLock={rangeLock} />}
+          />
         </Box>
-
-        {loadingVMRules ? (
-          <Box sx={{ py: 3 }}><LinearProgress /></Box>
-        ) : (
-          <Stack spacing={2}>
-            {/* Inline compact stats */}
-            <Stack direction="row" spacing={1.5} sx={{ flexWrap: 'wrap' }}>
-              <Chip
-                icon={<i className="ri-shield-check-line" style={{ fontSize: 14, color: '#22c55e' }} />}
-                label={`${t('networkPage.protectedCount')}: ${vmsWithFirewall}/${vmFirewallData.length}`}
-                size="small"
-                sx={{ height: 28, fontWeight: 600, bgcolor: alpha('#22c55e', 0.15), '& .MuiChip-label': { fontSize: 12 } }}
-              />
-              {unprotected > 0 && (
-                <Chip
-                  icon={<i className="ri-error-warning-line" style={{ fontSize: 14, color: '#ef4444' }} />}
-                  label={`${t('networkPage.unprotectedCount')}: ${unprotected}`}
-                  size="small"
-                  sx={{ height: 28, fontWeight: 600, bgcolor: alpha('#ef4444', 0.15), color: '#ef4444', '& .MuiChip-label': { fontSize: 12 } }}
-                />
-              )}
-            </Stack>
-
-            {/* Progress bars */}
-            <Box>
-              <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
-                <Typography variant="body2" sx={{ color: 'text.secondary' }}>{t('networkPage.protectionRate')}</Typography>
-                <Typography variant="body2" sx={{ fontWeight: 700 }}>{Math.round((vmsWithFirewall / totalVMs) * 100)}%</Typography>
-              </Box>
-              <LinearProgress variant="determinate" value={(vmsWithFirewall / totalVMs) * 100} sx={{ height: 10, borderRadius: 5, bgcolor: alpha('#ef4444', 0.2), '& .MuiLinearProgress-bar': { bgcolor: '#22c55e', borderRadius: 5 } }} />
-            </Box>
-          </Stack>
-        )}
-      </Paper>
-
-      {/* Section 3: Recommendations (action-oriented) */}
-      <Paper sx={{ p: 2.5, border: `1px solid ${alpha(theme.palette.divider, 0.1)}` }}>
-        <Typography variant="subtitle2" sx={{ fontWeight: 700, color: 'text.secondary', mb: 1.5 }}>
-          {t('network.zeroTrustRecommendations')}
-        </Typography>
-        <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
-          {(() => {
-            const recommendations: Array<{ severity: string; icon: string; title: string; description: string; action: string | null; onClick: (() => void) | null }> = []
-
-            if (currentOptions?.enable !== 1) {
-              recommendations.push({
-                severity: 'error', icon: 'ri-shield-cross-line',
-                title: t('security.firewall') + ' ' + t('common.disabled').toLowerCase(),
-                description: t('network.activateFirewall'), action: t('networkPage.viewDetails'), onClick: () => { onNavigateTab(1); onNavigateRulesSubTab(0) }
-              })
-            }
-            if (policyIn !== 'DROP') {
-              recommendations.push({
-                severity: 'warning', icon: 'ri-arrow-down-line',
-                title: t('firewall.policyInPermissive'),
-                description: t('network.switchToDropZeroTrust'), action: t('microseg.configure'), onClick: () => { onNavigateTab(1); onNavigateRulesSubTab(1) }
-              })
-            }
-            const unprotectedVMs = vmFirewallData.filter(v => !v.firewallEnabled)
-            if (unprotectedVMs.length > 0) {
-              recommendations.push({
-                severity: 'warning', icon: 'ri-computer-line',
-                title: t('network.vmsWithDisabledFirewall', { count: unprotectedVMs.length }),
-                description: t('network.enableFirewallVms'), action: t('firewall.viewVms'), onClick: () => { onNavigateTab(1); onNavigateRulesSubTab(2) }
-              })
-            }
-            if (recommendations.length === 0) {
-              recommendations.push({
-                severity: 'success', icon: 'ri-checkbox-circle-line',
-                title: t('backups.ok'), description: t('network.infrastructureZeroTrustCompliant'), action: null, onClick: null
-              })
-            }
-
-            return recommendations.map((rec, idx) => {
-              const severityColor = rec.severity === 'error' ? '#ef4444' : rec.severity === 'warning' ? '#f59e0b' : rec.severity === 'success' ? '#22c55e' : '#3b82f6'
-              return (
-                <Box key={idx} sx={{ p: 1.5, borderRadius: 1.5, flex: '1 1 280px', bgcolor: alpha(severityColor, 0.1), border: `1px solid ${alpha(severityColor, 0.3)}`, display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                  <Avatar sx={{ width: 32, height: 32, bgcolor: alpha(severityColor, 0.22) }}>
-                    <i className={rec.icon} style={{ fontSize: 16, color: severityColor }} />
-                  </Avatar>
-                  <Box sx={{ flex: 1, minWidth: 0 }}>
-                    <Typography variant="body2" sx={{ fontWeight: 600, fontSize: 12 }}>{rec.title}</Typography>
-                    <Typography variant="caption" sx={{ color: 'text.secondary', fontSize: 11 }}>{rec.description}</Typography>
-                  </Box>
-                  {rec.action && (
-                    <Button size="small" variant="outlined" onClick={rec.onClick!} sx={{ flexShrink: 0, fontSize: 11 }}>{rec.action}</Button>
-                  )}
-                </Box>
-              )
-            })
-          })()}
+        <Box sx={{ gridColumn: { xs: 'span 12', lg: 'span 5' }, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2.5 }}>
+          <TrafficDistribution
+            phase={listsPhase}
+            distribution={posture.distribution}
+            onOpenObserved={kind => openMicroseg('observation', { kind })}
+            onOpenUnknown={() => openMicroseg('observation', { source: 'unknown' })}
+            onOpenPolicy={() => openMicroseg('policy')}
+          />
+          <TopServices
+            phase={listsPhase}
+            rows={posture.services}
+            total={posture.servicesTotal}
+            onOpenAll={() => openMicroseg('observation')}
+            onOpenService={(service, kind) => openMicroseg('observation', { service, kind })}
+            onOpenPolicy={() => openMicroseg('policy')}
+          />
         </Box>
-      </Paper>
+      </Box>
+
+      {/* 2. Who talks to whom, down to the bottom of the page */}
+      <Box sx={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <TopConversations
+          phase={listsPhase}
+          rows={conversations.rows}
+          total={conversations.total}
+          zones={policy?.zones ?? NO_ZONES}
+          guestName={guestName}
+          onOpen={focus => openMicroseg('observation', focus)}
+          onOpenAll={() => openMicroseg('observation')}
+        />
+      </Box>
     </Box>
   )
 }

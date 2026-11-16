@@ -48,6 +48,7 @@ vi.mock("./apply", async importOriginal => {
   const actual = await importOriginal<typeof import("./apply")>()
   return { ...actual, applyExtentsWithProgress: vi.fn(async () => {}) }
 })
+vi.mock("./copy-rate-governor", () => ({ openCopyRateGovernor: vi.fn() }))
 vi.mock("./checksum-detector", () => ({ detectChangedExtentsByChecksum: vi.fn() }))
 vi.mock("./power-off", async importOriginal => {
   const actual = await importOriginal<typeof import("./power-off")>()
@@ -58,6 +59,13 @@ vi.mock("./finish", () => ({
   unmapTargetVolumes: vi.fn(async () => {}), verifyWarmDiskIntegrity: vi.fn(async () => {}),
 }))
 vi.mock("./zero-rate-target", () => ({ resolveWarmZeroRateLimit: vi.fn(async () => 100) }))
+// A manual hold runs the operator's test once, then is asked for the cutover;
+// the test itself has its own tests (migration-test.test.ts).
+vi.mock("./hold-wait", async importOriginal => {
+  const actual = await importOriginal<typeof import("./hold-wait")>()
+  return { ...actual, awaitNextHoldPass: vi.fn(async (_j: string, _c: unknown, _p: unknown, test?: { run: () => Promise<void> }) => { await test?.run(); return false }) }
+})
+vi.mock("./migration-test", () => ({ runMigrationTest: vi.fn(async () => {}) }))
 vi.mock("@/lib/vmware/soap", async importOriginal => {
   const actual = await importOriginal<typeof import("@/lib/vmware/soap")>()
   // vmwareToolsState and the timeouts stay real.
@@ -97,6 +105,8 @@ import { queryAllChangedAreas, soapGetSnapshotChangeIds } from "@/lib/vmware/cbt
 import { ZERO_MODE_OFFLOAD_MARKER } from "./target-provision"
 import type { WarmMigrationConfig } from "./types"
 import { runWarmMigration } from "./warm-pipeline"
+import { runMigrationTest } from "./migration-test"
+import { openCopyRateGovernor } from "./copy-rate-governor"
 
 // ── Fixtures ──
 
@@ -238,6 +248,7 @@ beforeEach(() => {
     baseline === "*" ? [{ offset: 0, length: capacityBytes }] : [])
   vi.mocked(soapGetSnapshotChangeIds).mockResolvedValue(new Map(DISKS.map(d => [d.deviceKey, `52 de ad/${d.deviceKey}`])))
   vi.mocked(startVddkReader).mockImplementation(async (_c, _ip, opts) => ({ nbdDev: `/dev/nbd${readerCounter++}`, sock: opts.sock, pwFile: opts.passwordFile }))
+  vi.mocked(openCopyRateGovernor).mockResolvedValue(null)
 })
 
 describe("runWarmMigration per-disk choices (#317 lot 2)", () => {
@@ -453,6 +464,34 @@ describe("runWarmMigration guest conversion at cutover (#1000)", () => {
   })
 })
 
+describe("runWarmMigration test of the waiting copy", () => {
+  const efiVm = () => ({ ...makeVmConfig(), firmware: "efi", nics: [{ label: "n", type: "Vmxnet3", macAddress: "00:50:56:00:00:09", network: "VM Network", pciSlot: 192 }] })
+  const attach = () => vi.mocked(attachDisksAndBoot).mock.calls[0][0]
+  const testTarget = () => vi.mocked(runMigrationTest).mock.calls[0][0]
+
+  it("hands the test the copied volumes and the hardware the cutover gives the guest", async () => {
+    vi.mocked(parseVmConfig).mockImplementation(() => efiVm() as any)
+
+    expect(await runToEnd("warm-test-1", makeConfig({ cutoverMode: "manual", convertGuest: true }))).toBeNull()
+
+    expect(runMigrationTest).toHaveBeenCalledTimes(1)
+    const t = testTarget()
+    expect(t).toMatchObject({ jobId: "warm-test-1", targetConnectionId: "conn-pve", node: "pve1", nodeIp: NODE })
+    expect(t.devices).toEqual(allocations().map(([storage, vol]) => `/dev/${storage}/${vol}`))
+    expect(t.conversion).toMatchObject({ name: "web01", firmware: "efi", isWindows: false, memoryMB: 4096 })
+    // what the cutover attached: the guest was not converted there (no v2v on this fake node)
+    expect(t.paramsFor(false).bootDiskSlot).toBe(attach().bootDiskSlot)
+    expect(t.paramsFor(false).diskSlots).toEqual(attach().diskSlots)
+    expect(t.paramsFor(true)).toMatchObject({ bootDiskSlot: "scsi0", diskSlots: ["scsi0", "scsi1", "scsi2"], nets: { net0: "virtio,bridge=vmbr0,macaddr=00:50:56:00:00:09" } })
+    expect(t.driveOpts?.(0, "scsi0", t.paramsFor(true))).toContain("iothread=1")
+  })
+
+  it("tests the guest as copied when the migration does not convert it", async () => {
+    expect(await runToEnd("warm-test-2", makeConfig({ cutoverMode: "manual", convertGuest: false }))).toBeNull()
+    expect(testTarget().conversion).toBeNull()
+  })
+})
+
 describe("runWarmMigration EL10 CPU level (#1000)", () => {
   it("warns at planning when an EL10 guest is bound for a CPU type below x86-64-v3, and keeps the choice", async () => {
     vi.mocked(parseVmConfig).mockImplementation(() => ({ ...makeVmConfig(), guestId: "rhel10_64Guest", guestOS: "Red Hat Enterprise Linux 10 (64-bit)" }) as any)
@@ -504,5 +543,50 @@ describe("runWarmMigration on a vCenter source the node cannot reach (roadmap#17
       : sshRouter(c, h, command, t, o)) as any)
     const err = await runToEnd("warm-vc-4", makeConfig())
     expect(err?.message).toBe(`Could not read the TLS certificate of ${VC} from the Proxmox node pve1: Command timed out`)
+  })
+})
+
+describe("runWarmMigration copy rate cap", () => {
+  it("caps the full pass through a governor around each reader and leaves the final cutover pass unlimited", async () => {
+    const order: string[] = []
+    vi.mocked(openCopyRateGovernor).mockImplementation(async a => a.capped
+      ? { initialMbps: 25, start: () => { order.push(`start ${a.sock}`) }, stop: async () => { order.push(`stop ${a.sock}`) } }
+      : null)
+    vi.mocked(startVddkReader).mockImplementation(async (_c, _ip, opts) => {
+      order.push(`reader ${opts.sock} ${opts.initialRateMbps ?? 0}`)
+      return { nbdDev: `/dev/nbd${readerCounter++}`, sock: opts.sock, pwFile: opts.passwordFile }
+    })
+    const { stopVddkReader } = await import("./vddk-reader")
+    vi.mocked(stopVddkReader).mockImplementation(async (_c, _ip, h) => { order.push(`release ${h.sock}`) })
+    // The cutover snapshot finds a change on every disk, so that pass opens readers too.
+    const names = new Map<string, string>()
+    vi.mocked(soapCreateSnapshot).mockImplementation(async (_s, _vm, name) => { const mor = `snapshot-${++snapCounter}`; names.set(mor, name); return mor })
+    vi.mocked(queryAllChangedAreas).mockImplementation(async (_s, _vm, snap, _key, baseline, capacityBytes) => {
+      if (baseline === "*") return [{ offset: 0, length: capacityBytes }]
+      return names.get(snap)?.endsWith("-cutover") ? [{ offset: 0, length: MiB }] : []
+    })
+
+    const err = await runToEnd("warm-rate-1", makeConfig())
+
+    expect(err).toBeNull()
+    const capped = vi.mocked(openCopyRateGovernor).mock.calls.map(c => [c[0].capped, c[0].jobId])
+    expect(capped.filter(([c]) => c)).toHaveLength(DISKS.length)
+    expect(capped.filter(([c]) => !c)).toHaveLength(DISKS.length)
+    const sock0 = `/tmp/proxcenter-vddk-warm-rate-1-${DISKS[0].deviceKey}.sock`
+    // full pass: the reader starts at the governor's share, the governor runs while it reads and stops before it is released
+    expect(order.slice(0, 4)).toEqual([`reader ${sock0} 25`, `start ${sock0}`, `stop ${sock0}`, `release ${sock0}`])
+    // cutover pass: unlimited reader, no governor
+    expect(order.filter(o => o === `reader ${sock0} 0`)).toHaveLength(1)
+  })
+
+  it("stops the governor when the reader cannot start", async () => {
+    const stop = vi.fn(async () => {})
+    vi.mocked(openCopyRateGovernor).mockImplementation(async a => a.capped ? { initialMbps: 10, start: vi.fn(), stop } : null)
+    vi.mocked(startVddkReader).mockRejectedValue(new Error("nbdkit-vddk socket never appeared"))
+
+    const err = await runToEnd("warm-rate-2", makeConfig())
+
+    expect(err?.message).toContain("nbdkit-vddk socket never appeared")
+    expect(stop).toHaveBeenCalledTimes(1)
   })
 })

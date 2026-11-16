@@ -28,6 +28,14 @@ export interface SharedTask {
   kind: "migration"
   label: string
   sourceVmName: string | null
+  /**
+   * What reopens the dialog the run was started from (lib/migration/migrationJobOpen):
+   * the Inventory page of its source host, its source VM, and its batch when it
+   * belongs to a bulk migration.
+   */
+  sourceConnectionId: string
+  sourceVmId: string
+  batchId: string | null
   targetNode: string
   targetVmid: number | null
   status: string
@@ -46,6 +54,8 @@ export interface SharedTask {
    */
   projectedDowntimeSec: number | null
   cutoverMode: "auto" | "manual" | null
+  /** cold, live, warm…: a warm run's cancel offers to remove its copy on the target. */
+  migrationType: string | null
   /** Guest conversion default of a VMware warm job (#1000); null when the job has no such choice. */
   convertGuest: boolean | null
   isMine: boolean
@@ -113,6 +123,9 @@ export function toSharedTask(
     kind: "migration",
     label: `${vm} (${srcType} -> Proxmox)`,
     sourceVmName: job.sourceVmName ?? null,
+    sourceConnectionId: job.sourceConnectionId,
+    sourceVmId: job.sourceVmId,
+    batchId: job.batchId ?? null,
     targetNode: job.targetNode,
     targetVmid: job.targetVmid ?? null,
     status: job.status,
@@ -126,6 +139,7 @@ export function toSharedTask(
     error: job.error ?? null,
     projectedDowntimeSec: job.projectedDowntimeSec ?? null,
     cutoverMode: (job.config as any)?.cutoverMode ?? null,
+    migrationType: (job.config as any)?.migrationType ?? null,
     convertGuest: typeof (job.config as any)?.convertGuest === "boolean" ? (job.config as any).convertGuest : null,
     isMine: opts.isMine,
     createdByName: opts.createdByName,

@@ -102,6 +102,49 @@ describe("POST /api/v1/migrations — warm routing", () => {
     expect(h.prisma.migrationJob.create.mock.calls[0][0].data.config).toMatchObject({ cutoverMode: "manual" })
   })
 
+  it("forwards a sync interval typed in the dialog to the warm pipeline and keeps it for a retry", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, cutoverMode: "manual", syncIntervalSec: 1800 } })
+    expect(res.status).toBe(200)
+
+    await runAfters()
+    expect(warm.mock.calls[0][1]).toMatchObject({ cutoverMode: "manual", syncIntervalSec: 1800 })
+    expect(createdJobData().config).toMatchObject({ syncIntervalSec: 1800 })
+  })
+
+  it("leaves the sync interval out when the caller omits it, so the source connection's setting applies", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    await callRoute(POST, { body: { ...body, cutoverMode: "manual" } })
+    await runAfters()
+    expect(warm.mock.calls[0][1]).not.toHaveProperty("syncIntervalSec")
+    expect(createdJobData().config).not.toHaveProperty("syncIntervalSec")
+  })
+
+  it("rejects a sync interval under a minute or over a day", async () => {
+    for (const syncIntervalSec of [59, 86401, 90.5, "soon"]) {
+      h.prisma.connection.findUnique.mockReset()
+      const res = await callRoute(POST, { body: { ...body, cutoverMode: "manual", syncIntervalSec } })
+      expect(res.status, String(syncIntervalSec)).toBe(400)
+      expect((await readJson<any>(res))?.error).toBe("syncIntervalSec must be an integer between 60 and 86400 seconds")
+    }
+    expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+  })
+
+  it("accepts a sync interval sent with an automatic cutover, where it has no effect", async () => {
+    h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+
+    const res = await callRoute(POST, { body: { ...body, syncIntervalSec: 600 } })
+    expect(res.status).toBe(200)
+  })
+
   it("leaves cutoverMode out of the payload when the caller omits it", async () => {
     h.prisma.connection.findUnique
       .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
@@ -150,6 +193,35 @@ describe("POST /api/v1/migrations — warm routing", () => {
       pair()
       expect((await callRoute(POST, { body: { ...body, zeroRateLimitMBps: 0 } })).status).toBe(200)
       expect(h.prisma.migrationJob.create.mock.calls[1][0].data.config).not.toHaveProperty("zeroRateLimitMBps")
+    } finally {
+      h.licensed = true
+    }
+  })
+
+  // Copy rate cap: a bad value is refused, never turned into "no cap".
+  it.each([{ mbps: -1 }, { mbps: 1.5 }, { mbps: 100_001 }, "50", { mbps: 50, schedule: { from: "25:00", to: "07:00", tz: "Europe/Paris", offHoursMbps: 0 } }])(
+    "rejects the copy rate cap %j before creating a job", async (cap) => {
+      const res = await callRoute(POST, { body: { ...body, copyRateLimit: cap } })
+      expect(res.status).toBe(400)
+      expect((await readJson<any>(res))?.error).toMatch(/copyRateLimit/)
+      expect(h.prisma.migrationJob.create).not.toHaveBeenCalled()
+    })
+
+  it("keeps the copy rate cap of a warm job on Enterprise and drops it without the migration feature", async () => {
+    const pair = () => h.prisma.connection.findUnique
+      .mockResolvedValueOnce({ id: "src", type: "vmware", subType: null, name: "esxi", baseUrl: "https://esxi" })
+      .mockResolvedValueOnce({ id: "tgt", type: "pve", name: "pve" })
+    const cap = { mbps: 50, schedule: { from: "08:00", to: "19:00", tz: "Europe/Paris", offHoursMbps: 0 } }
+
+    pair()
+    expect((await callRoute(POST, { body: { ...body, copyRateLimit: cap } })).status).toBe(200)
+    expect(createdJobData().config).toMatchObject({ copyRateLimit: cap })
+
+    h.licensed = false
+    try {
+      pair()
+      expect((await callRoute(POST, { body: { ...body, copyRateLimit: cap } })).status).toBe(200)
+      expect((h.prisma.migrationJob.create as any).mock.calls[1][0].data.config).not.toHaveProperty("copyRateLimit")
     } finally {
       h.licensed = true
     }
@@ -394,6 +466,13 @@ describe("POST /api/v1/migrations, NFC concurrency (#807)", () => {
     expect(res.status).toBe(200)
     await runAfters()
     expect(v2v.mock.calls[0]?.[1]).toMatchObject({ nfcConcurrency: 4 })
+  })
+
+  it("leaves the copy rate cap out of a cold job", async () => {
+    vcenterConnections()
+    const res = await callRoute(POST, { body: { ...body, migrationType: "cold", copyRateLimit: { mbps: 50 } } })
+    expect(res.status).toBe(200)
+    expect(createdJobData().config).not.toHaveProperty("copyRateLimit")
   })
 
   it("leaves nfcConcurrency out of the payload when the caller omits it", async () => {

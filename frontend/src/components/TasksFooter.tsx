@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { useTranslations, useLocale } from 'next-intl'
 import { getDateLocale } from '@/lib/i18n/date'
 
@@ -32,10 +33,11 @@ import { useJobs } from '@/hooks/useJobs'
 import { useRefreshInterval } from '@/hooks/useRefreshInterval'
 import { useLicense } from '@/contexts/LicenseContext'
 import { type MergedPCTask } from '@/lib/tasks/mergeSharedTasks'
+import { migrationStepText } from '@/lib/tasks/activeMigrations'
 import { mergeTaskbarRows } from '@/lib/tasks/orchestratorTaskRows'
 import { formatTaskDuration } from '@/lib/tasks/archive'
 import TaskDetailDialog from './TaskDetailDialog'
-import SharedTaskDetailDialog from '@/components/SharedTaskDetailDialog'
+import { migrationFromTaskCenterJob, openMigration } from '@/lib/migration/migrationJobOpen'
 import JobDetailDialog from '@/components/tasks/JobDetailDialog'
 import {
   PVE_TASK_STOP_PERMISSION,
@@ -267,7 +269,8 @@ export default function TasksFooter({
 
   const openJobDetail = (task: MergedPCTask) => {
     const job = task.jobId ? jobsById.get(task.jobId) : null
-    if (!job) return
+    // A migration opens its migrate dialog on the single click already.
+    if (!job || job.type === 'migration') return
 
     setJobActionError(null)
     setDetailJob(job)
@@ -286,7 +289,6 @@ export default function TasksFooter({
     const fresh = (refreshed as any)?.data?.find((j: any) => j.id === job.id)
     if (fresh) setDetailJob(fresh)
   }
-  const [detailJobId, setDetailJobId] = useState<string | null>(null)
   const pcRunningCount = mergedPcTasks.filter(t => t.status === 'running').length
 
   // SWR hook for task events
@@ -299,6 +301,19 @@ export default function TasksFooter({
   const hasPermission = (permission: string) => rbac?.hasPermission?.(permission) ?? false
   const stop = useStopTask(async () => {
     await Promise.all([mutateTasks(), mutateJobs(), mutateSharedTasks()])
+  })
+
+  /** The detail of a row, the step of a shared migration read as the running-tasks menu reads it. */
+  const pcTaskDetail = (task: MergedPCTask) => (task.migrationStep ? migrationStepText(k => t(k as any), task.migrationStep) : task.detail) || undefined
+
+  /**
+   * What the stop confirmation of a migration offers: its type (a warm run can
+   * have its copy removed) and its VMID on the target, from the Task Center
+   * row when there is one, from the shared row otherwise.
+   */
+  const migrationStopChoice = (metadata: any, task: MergedPCTask) => ({
+    migrationType: metadata?.migrationType ?? task.migrationType ?? null,
+    targetVmid: metadata?.targetVmid ?? task.targetVmid ?? null,
   })
 
   /**
@@ -318,9 +333,10 @@ export default function TasksFooter({
 
       return {
         id: task.id,
-        run: () => runJobAction(job, 'cancel'),
+        run: opts => runJobAction(job, 'cancel', opts),
         body: job.type === 'migration' ? t('tasks.shared.cancelConfirmStop') : t('tasks.stop.confirmBodyJob'),
         warning: job.type === 'migration' ? t('tasks.shared.cancelConfirmLeftovers') : undefined,
+        ...(job.type === 'migration' ? { migration: migrationStopChoice(job.metadata, task) } : {}),
       }
     }
 
@@ -344,9 +360,10 @@ export default function TasksFooter({
 
       return {
         id: task.id,
-        run: () => runJobAction(migration, 'cancel'),
+        run: opts => runJobAction(migration, 'cancel', opts),
         body: t('tasks.shared.cancelConfirmStop'),
         warning: t('tasks.shared.cancelConfirmLeftovers'),
+        migration: migrationStopChoice(null, task),
       }
     }
 
@@ -426,16 +443,36 @@ export default function TasksFooter({
     [mergedPcTasks, query]
   )
 
+  // A migration row opens the dialog the run was started from, wherever the
+  // operator is (lib/migration/migrationJobOpen): the migrate dialog of a
+  // single run, the follow-up of its batch for a bulk one. The shared row
+  // carries its source and batch; a row of this tab is looked up there.
+  const router = useRouter()
+  const openMigrationRow = (task: MergedPCTask) => {
+    const jobId = task.jobId ?? task.id.replace(/^migration-/, '')
+    const known = (sharedResp?.data ?? []).find(st => st.id === jobId)
+    const listed = migrationFromTaskCenterJob(jobsById.get(jobId))
+    openMigration(
+      {
+        id: jobId,
+        sourceConnectionId: task.sourceConnectionId ?? known?.sourceConnectionId ?? listed?.sourceConnectionId,
+        batchId: task.batchId ?? known?.batchId ?? listed?.batchId,
+      },
+      { restore: restoreTask, navigate: url => router.push(url) },
+    )
+  }
+
+  // The Task Center lists migrations too, under the same id: those rows are
+  // migrations first, whatever path brought them into the bar.
+  const isMigrationRow = (task: MergedPCTask) =>
+    task.shared || task.id.startsWith('migration-') || (!!task.jobId && jobsById.get(task.jobId)?.type === 'migration')
+
   const clickPcTask = (task: MergedPCTask) => {
+    if (isMigrationRow(task)) return openMigrationRow(task)
     // A row backed by a Task Center job opens its dialog on double-click, like
-    // the Proxmox tab: nothing to do on a single click. The others keep their
-    // own behaviour.
+    // the Proxmox tab: nothing to do on a single click.
     if (task.jobId && jobsById.has(task.jobId)) return
-    if (task.shared) return void setDetailJobId(task.jobId ?? task.id.replace(/^migration-/, ''))
-    // The migrate dialog that owns this row only exists on the inventory page.
-    // Anywhere else nothing reopens it, so show the job's detail, which carries
-    // the same cutover and cancel controls.
-    if (!restoreTask(task.id) && task.id.startsWith('migration-')) setDetailJobId(task.id.replace(/^migration-/, ''))
+    restoreTask(task.id)
   }
 
   // State - initialize with defaults, then hydrate from localStorage
@@ -1141,9 +1178,9 @@ export default function TasksFooter({
                         <Typography variant="caption" sx={{ fontWeight: 600, flexShrink: 0, maxWidth: '45%' }} noWrap>
                           {task.label}
                         </Typography>
-                        {task.detail && (
+                        {pcTaskDetail(task) && (
                           <Typography variant="caption" sx={{ opacity: 0.5, fontSize: '0.65rem', flex: 1, minWidth: 0 }} noWrap>
-                            {task.detail}
+                            {pcTaskDetail(task)}
                           </Typography>
                         )}
                         {task.shared && task.readOnly && task.startedByName && (
@@ -1300,6 +1337,7 @@ return ''
       busy={stop.busy}
       body={stop.target?.body}
       warning={stop.target?.warning}
+      migration={stop.target?.migration}
       onKeep={stop.dismiss}
       onConfirm={stop.confirm}
     />
@@ -1312,7 +1350,6 @@ return ''
     />
 
     {/* Shared Task Detail Dialog - outside dark ThemeProvider so it follows user theme */}
-    <SharedTaskDetailDialog jobId={detailJobId} onClose={() => setDetailJobId(null)} />
     <JobDetailDialog
       open={!!detailJob}
       job={detailJob}

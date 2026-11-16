@@ -6,7 +6,7 @@ import { reserveTargetVmid } from "../reserve-target-vmid"
 import { releaseVmids } from "../vmid-reservation"
 import { assertTargetStorageSpace, gib } from "./target-space"
 import { isFileBasedStorage } from "@/lib/proxmox/storage"
-import { executeSSH, shellEscape } from "@/lib/ssh/exec"
+import { executeSSH } from "@/lib/ssh/exec"
 import {
   soapLogin, soapLogout, soapGetVmConfig, parseVmConfig, soapNameDistributedNics, vmwareToolsState, soapCreateSnapshot, soapRemoveSnapshot,
   soapWaitForConsolidation, soapFindSnapshotsByNamePrefix, CONSOLIDATION_TIMEOUT_MS, soapGetGuestStaticIpv4,
@@ -17,9 +17,9 @@ import {
   cbtEligibility, soapEnableCbt, soapDisableCbt, queryAllChangedAreas, soapGetSnapshotChangeIds,
   soapGuestShutdown, soapWaitPoweredOff, soapKeepAlive,
 } from "@/lib/vmware/cbt"
-import { describeHardwareChanges, isWindowsVm, mapEsxiToPveConfig, virtioDevices, withoutVirtioChoices } from "../configMapper"
+import { describeHardwareChanges, isWindowsVm, mapEsxiToPveConfig, virtioDevices, withoutVirtioChoices, type PveVmCreateParams } from "../configMapper"
 import { bytesPerStorage, describeDiskPlan, describeOverrides, diskDriveOptions, planDiskTargets, planStorages } from "../target-overrides"
-import { volumesToFree, volumesToKeep, PVESM_FREE_TIMEOUT_MS, type AllocatedVolume } from "../pvesm-alloc"
+import { type AllocatedVolume } from "../pvesm-alloc"
 import { getNodeSshEndpointForMigration } from "../pve-tasks"
 import { decideNextPass, type PassStat, type ConvergenceConfig, type ConvergenceDecision } from "./convergence"
 import { initDiskState, recordPass, type DiskWarmState } from "./state"
@@ -33,6 +33,8 @@ import type { Extent } from "./extents"
 import { startSoapKeepAlive } from "./session-keepalive"
 import { startJobHeartbeat } from "../job-heartbeat"
 import { resolveWarmZeroRateLimit } from "./zero-rate-target"
+import { isCappedPass } from "./copy-rate"
+import { openCopyRateGovernor } from "./copy-rate-governor"
 import { resolveIntegritySettings } from "../integrity-target"
 import { faultInjectionFromEnv } from "../integrity"
 import { estimateIntegritySecondsPerDisk } from "../integrity-settings"
@@ -44,8 +46,8 @@ import { describeHeadroom, isThinHeadroom, parseVmDatastoreMors, soapGetDatastor
 import type { WarmMigrationConfig } from "./types"
 import {
   registerJob, unregisterJob, acquireVmLock, releaseVmLock,
-  updateJob, updateJobLive, appendLog, appendStep, readJobConfig, isCancelled, isCutoverRequested,
-  sleepUnlessCutover, awaitOperatorCutover, runDeltaPassWithRetry, HOLD_PASS_INTERVAL_MS,
+  updateJob, updateJobLive, appendLog, appendStep, readJobConfig, isCancelled, cancelRemovesTarget, isCutoverRequested,
+  awaitOperatorCutover, runDeltaPassWithRetry,
 } from "./job-control"
 import {
   applyExtentsWithProgress, checksumDiskWindows, scaleWarmProgress, warmFinalTransfer,
@@ -53,7 +55,10 @@ import {
 } from "./apply"
 import { createTargetVmShell, provisionBlockTargets, markVolumesCopied } from "./target-provision"
 import { cleanShutdownAndConfirm, isVmwareToolsUnavailable, type PowerOffOps } from "./power-off"
-import { attachDisksAndBoot, removeTargetVmOnFailure, unmapTargetVolumes, verifyWarmDiskIntegrity } from "./finish"
+import { attachDisksAndBoot, releaseTargetVolumes, removeTargetVmOnFailure, unmapTargetVolumes, verifyWarmDiskIntegrity } from "./finish"
+import { awaitNextHoldPass, describeHoldInterval, type HoldTest } from "./hold-wait"
+import { runMigrationTest } from "./migration-test"
+import { catchUpBeforeCutover } from "./catch-up"
 import { conversionNotAppliedMessage, convertGuestAtCutover, GUEST_CONVERSION_ESTIMATE_SEC } from "./guest-conversion"
 import { guestNicsFromNets } from "./guest-network"
 import { warnIfEl10OnLowCpu } from "../el10-check"
@@ -479,15 +484,22 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
       diskState.set(deviceKey, initDiskState(deviceKey))
     }
 
+    // Copy rate cap of a reader (copy-rate.ts): a governor on every capped pass.
+    const openCappedReaderGovernor = (sock: string, capped: boolean) => openCopyRateGovernor({
+      capped, jobId, connectionId: config.targetConnectionId, nodeIp, sock, log: (msg, level) => appendLog(jobId, msg, level),
+    })
+
     // Read one disk of a snapshot through VDDK and apply its extents to the target.
     async function readAndApply(disk: EsxiDiskInfo, diskIndex: number, snapMor: string, extents: Extent[], pass: PassProgress): Promise<number> {
       const bytes = extents.reduce((s, e) => s + e.length, 0)
       if (extents.length === 0) return 0
       const sock = `/tmp/proxcenter-vddk-${jobId}-${disk.deviceKey}.sock`
       const pwFile = `/tmp/proxcenter-vddk-${jobId}-${disk.deviceKey}.pw`
-      const opts: VddkOpts = { sock, libdir, server: copy.server, user: username, passwordFile: pwFile, thumbprint, moref: config.sourceVmId, diskPath: disk.fileName, snapshot: snapMor }
-      const reader = await startVddkReader(config.targetConnectionId, nodeIp, opts, password)
+      const governor = await openCappedReaderGovernor(sock, isCappedPass(pass.currentStep))
+      const opts: VddkOpts = { sock, libdir, server: copy.server, user: username, passwordFile: pwFile, thumbprint, moref: config.sourceVmId, diskPath: disk.fileName, snapshot: snapMor, initialRateMbps: governor?.initialMbps }
+      const reader = await startVddkReader(config.targetConnectionId, nodeIp, opts, password).catch(async (e) => { await governor?.stop(); throw e })
       activeReaders.push(reader)
+      governor?.start()
       try {
         await applyExtentsWithProgress({
           jobId, connectionId: config.targetConnectionId, nodeIp, nbdDev: reader.nbdDev, dev: targetDev.get(disk.deviceKey)!,
@@ -495,6 +507,7 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
         })
         return bytes
       } finally {
+        await governor?.stop()
         await stopVddkReader(config.targetConnectionId, nodeIp, reader).catch(() => {})
         const idx = activeReaders.indexOf(reader)
         if (idx >= 0) activeReaders.splice(idx, 1)
@@ -639,6 +652,57 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
       return ips
     }
 
+    // What the guest conversion gets, at cutover and in a test of the waiting copy.
+    const isWindows = isWindowsVm(vmConfig)
+    const conversionInputFor = (ips: GuestStaticIpv4[]) => ({
+      name: vmConfig.name, firmware: (vmConfig.firmware === "efi" ? "efi" : "bios") as "efi" | "bios", isWindows, guestOs: vmConfig.guestOS,
+      memoryMB: vmConfig.memoryMB, staticIps: ips,
+      nics: guestNicsFromNets(pveParams.nets, i => {
+        const slot = vmConfig.nics[i]?.pciSlot
+        return slot ? [`ens${slot}`] : []
+      }),
+    })
+    // The VM the guest boots as: converted, after a conversion that was not
+    // applied, or without any conversion asked for.
+    const bootParamsFor = (outcome: "converted" | "failed" | "not-requested"): PveVmCreateParams => {
+      if (outcome === "converted") return mapEsxiToPveConfig(vmConfig, targetVmid!, config.targetStorage, config.networkBridge, config.vlanTag, config.cpuType, overrides, { buses, guestConverted: true })
+      // #1173: the review step's VirtIO choices were made for a converted
+      // guest. A Windows left without the drivers would not see those disks
+      // and NICs: they go back to the hardware it has drivers for.
+      if (outcome === "failed" && isWindows) {
+        const inbox = withoutVirtioChoices(overrides, buses)
+        const fallback = mapEsxiToPveConfig(vmConfig, targetVmid!, config.targetStorage, config.networkBridge, config.vlanTag, config.cpuType, inbox.overrides, { buses: inbox.buses })
+        if (describeHardwareChanges(pveParams, fallback).length > 0) return fallback
+      }
+      return pveParams
+    }
+    // ui#1331: the operator's choice for each disk, else the job profile,
+    // else discard on a thin storage and iothread where the bus supports it.
+    const driveOptsFor = (p: PveVmCreateParams) => (i: number, slot: string) => diskDriveOptions({
+      slot, storageType: storageTypes.get(diskPlan.kept[i].storage), scsihw: p.scsihw, profile: config.diskOptions, disk: diskPlan.kept[i].options,
+    })
+    /** The latest conversion choice: the cutover dialog writes it on the row, else the launch value. */
+    const wantsConversion = async () => {
+      const latest = await readJobConfig(jobId).catch(() => ({} as Record<string, any>))
+      return typeof latest.convertGuest === "boolean" ? latest.convertGuest : config.convertGuest !== false
+    }
+    // A test of the waiting copy (migration-test.ts): the copied volumes, the
+    // conversion and the hardware the cutover would use.
+    const migrationTest: HoldTest = {
+      run: async () => {
+        const convert = await wantsConversion()
+        // Boot parameters of a test whose guest conversion did not apply.
+        const notConverted = convert ? "failed" : "not-requested"
+        await runMigrationTest({
+          jobId, pveConn, targetConnectionId: config.targetConnectionId, node: config.targetNode, nodeIp,
+          devices: vmConfig.disks.map(d => targetDev.get(d.deviceKey) ?? ""),
+          conversion: convert ? conversionInputFor(await readWindowsStaticIps().catch(() => [])) : null,
+          paramsFor: converted => bootParamsFor(converted ? "converted" : notConverted),
+          driveOpts: (i, slot, p) => driveOptsFor(p)(i, slot),
+        })
+      },
+    }
+
     // Source-side power operations for the confirmed power-off (see cleanShutdownAndConfirm).
     const powerOffOps: PowerOffOps = {
       requestShutdown: () => soapGuestShutdown(soapSession!, config.sourceVmId),
@@ -663,6 +727,10 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
       markVolumesCopied(allocatedVolumes)
       const fullSec = Math.max(1, (Date.now() - t0) / 1000)
       let throughput = fullBytes / fullSec
+      // The rate of the full copy stays the reference for what a sync can copy:
+      // the rate of a delta pass divides a few megabytes by a time that is
+      // mostly snapshot handling, and says nothing about the copy itself.
+      const copyRateBytesPerSec = throughput
       await updateJob(jobId, "full_copy", { progress: 80, bytesTransferred: BigInt(fullBytes), transferSpeed: `${(throughput / 1048576).toFixed(0)} MB/s` })
       await appendLog(jobId, `Full copy done: ${(fullBytes / 1073741824).toFixed(2)} GB at ${(throughput / 1048576).toFixed(0)} MB/s`, "success")
 
@@ -675,13 +743,18 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
         + (config.convertGuest === false ? 0 : GUEST_CONVERSION_ESTIMATE_SEC)
       const cfg: ConvergenceConfig = { downtimeBudgetSec: budget, maxPasses, shutdownSec: 20, bootSec: 30, verifySec, cutoverMode }
       if (cutoverMode === "manual") {
-        await appendLog(jobId, `Manual cutover: replication will keep running and the migration will wait for you. Click "Cutover now" when your window opens.`, "info")
+        await appendLog(jobId, `Manual cutover: replication will keep running, with a sync every ${await describeHoldInterval(config)}, and the migration will wait for you. Click "Cutover now" when your window opens.`, "info")
       }
       await appendStep(jobId, "delta", "Delta sync")
       let pass = 0
+      // The operator asked for the cutover (hold or gate), as opposed to an
+      // automatic one decided right after a pass: the copy may be an interval
+      // behind, so it is brought up to date before the source stops.
+      let operatorCutover = false
+      let lastPassEndMs: number | undefined
       while (true) {
         if (isCancelled(jobId)) throw new Error("Migration cancelled")
-        if (isCutoverRequested(jobId)) { await appendLog(jobId, "Operator requested cutover — proceeding to final delta", "info"); break }
+        if (isCutoverRequested(jobId)) { await appendLog(jobId, "Operator requested cutover — proceeding to final delta", "info"); operatorCutover = true; break }
         const tk = Date.now()
         await updateJob(jobId, "delta_sync", { currentStep: `delta_${pass + 1}` })
         // Each delta pass advances through an equal slice of the 80→95 delta
@@ -698,8 +771,9 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
         // than thrown away with hours of replication (#1028).
         const deltaBytes = await runDeltaPassWithRetry(jobId, `Delta pass ${pass + 1}`,
           () => runCbtPass(`delta-${pass + 1}`, dk => diskState.get(dk)!.currentChangeId || "*", deltaWindow))
-        if (deltaBytes === null) { await appendLog(jobId, "Operator requested cutover — proceeding to final delta", "info"); break }
+        if (deltaBytes === null) { await appendLog(jobId, "Operator requested cutover — proceeding to final delta", "info"); operatorCutover = true; break }
         copiedBytes += deltaBytes
+        lastPassEndMs = Date.now()
         const dsec = Math.max(1, (Date.now() - tk) / 1000)
         throughput = deltaBytes > 0 ? deltaBytes / dsec : throughput
         await appendLog(jobId, `Delta pass ${pass + 1}: ${(deltaBytes / 1048576).toFixed(1)} MB`)
@@ -708,16 +782,25 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
         if (decision.action === "cutover") break
         if (decision.action === "operator-gate") {
           await awaitOperatorCutover(jobId, decision.projectedDowntimeSec, budget, maxPasses, { floorSec: cfg.shutdownSec + cfg.bootSec + verifySec })
+          operatorCutover = true
           break
         }
         // A converged source yields empty passes; without pacing they would
-        // snapshot vCenter in a tight loop for the whole hold. The wait is
-        // sliced so a cutover request is still picked up within a second.
-        if (cutoverMode === "manual" && !(await sleepUnlessCutover(jobId, HOLD_PASS_INTERVAL_MS))) {
+        // snapshot vCenter in a tight loop for the whole hold. The job gives
+        // its migration slot back while it sleeps and takes one again for the
+        // next pass (hold-slot); a cutover request is picked up within a second.
+        if (cutoverMode === "manual" && !(await awaitNextHoldPass(jobId, config, { durationSec: dsec, deltaBytes, throughputBytesPerSec: copyRateBytesPerSec, budgetSec: budget, fixedDowntimeSec: cfg.shutdownSec + cfg.bootSec + verifySec }, migrationTest))) {
           await appendLog(jobId, "Operator requested cutover — proceeding to final delta", "info")
+          operatorCutover = true
           break
         }
         pass++
+      }
+
+      if (operatorCutover) {
+        await updateJob(jobId, "cutover", { currentStep: "catch_up" })
+        copiedBytes += await catchUpBeforeCutover(jobId, lastPassEndMs,
+          () => runCbtPass("catchup", dk => diskState.get(dk)!.currentChangeId || "*", { status: "cutover", currentStep: "catch_up", rangeStart: 94, rangeEnd: 95 }))
       }
 
       // ── cutover: confirmed power-off → final delta → verify → attach → boot ──
@@ -756,9 +839,11 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
           const disk = vmConfig.disks[i]
           const sock = `/tmp/proxcenter-vddk-${jobId}-${disk.deviceKey}.sock`
           const pwFile = `/tmp/proxcenter-vddk-${jobId}-${disk.deviceKey}.pw`
-          const opts: VddkOpts = { sock, libdir, server: copy.server, user: username, passwordFile: pwFile, thumbprint, moref: config.sourceVmId, diskPath: disk.fileName, snapshot: snapMor }
-          const reader = await startVddkReader(config.targetConnectionId, nodeIp, opts, password)
+          const governor = await openCappedReaderGovernor(sock, true)
+          const opts: VddkOpts = { sock, libdir, server: copy.server, user: username, passwordFile: pwFile, thumbprint, moref: config.sourceVmId, diskPath: disk.fileName, snapshot: snapMor, initialRateMbps: governor?.initialMbps }
+          const reader = await startVddkReader(config.targetConnectionId, nodeIp, opts, password).catch(async (e) => { await governor?.stop(); throw e })
           activeReaders.push(reader)
+          governor?.start()
           try {
             const dev = targetDev.get(disk.deviceKey)!
             // Per-disk progress windows: unlike runCbtPass there is no upfront
@@ -774,6 +859,7 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
             let lastScanFlush = 0
             const extents = await detectChangedExtentsByChecksum(config.targetConnectionId, nodeIp, reader.nbdDev, dev, 256 * 1024 * 1024, disk.capacityBytes, {
               inactivityMs: APPLY_INACTIVITY_MS,
+              cancelled: () => isCancelled(jobId),
               onProgress: (scannedBlocks, totalBlocks) => {
                 const now = Date.now()
                 if (now - lastScanFlush < PROGRESS_LOG_INTERVAL_MS) return
@@ -800,6 +886,7 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
             })
             copiedBytes += extents.reduce((s, e) => s + e.length, 0)
           } finally {
+            await governor?.stop()
             await stopVddkReader(config.targetConnectionId, nodeIp, reader).catch(() => {})
             const idx = activeReaders.indexOf(reader)
             if (idx >= 0) activeReaders.splice(idx, 1)
@@ -851,44 +938,29 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
 
     // ── guest conversion (#1000): the operator's latest choice, read back from
     // the job row (the "Cutover now" dialog writes it there), else the launch value ──
-    const latest = await readJobConfig(jobId).catch(() => ({} as Record<string, any>))
-    const convertGuest = typeof latest.convertGuest === "boolean" ? latest.convertGuest : config.convertGuest !== false
+    const convertGuest = await wantsConversion()
     let bootParams = pveParams
     let converted = false
-    const isWindows = isWindowsVm(vmConfig)
     if (convertGuest) {
       await updateJob(jobId, "verify", { currentStep: "guest_conversion", progress: 98 })
       await appendStep(jobId, "conversion", "Guest conversion")
       const result = await convertGuestAtCutover({
-        jobId, connectionId: config.targetConnectionId, nodeIp,
-        name: vmConfig.name, firmware: vmConfig.firmware === "efi" ? "efi" : "bios", isWindows, guestOs: vmConfig.guestOS,
-        memoryMB: vmConfig.memoryMB, devices: vmConfig.disks.map(d => targetDev.get(d.deviceKey) ?? ""),
-        staticIps,
-        nics: guestNicsFromNets(pveParams.nets, i => {
-          const slot = vmConfig.nics[i]?.pciSlot
-          return slot ? [`ens${slot}`] : []
-        }),
+        jobId, connectionId: config.targetConnectionId, nodeIp, ...conversionInputFor(staticIps),
+        devices: vmConfig.disks.map(d => targetDev.get(d.deviceKey) ?? ""),
         log: (msg, level) => appendLog(jobId, msg, level), isCancelled: () => isCancelled(jobId),
       })
       if (result.converted) {
         converted = true
-        bootParams = mapEsxiToPveConfig(vmConfig, targetVmid, config.targetStorage, config.networkBridge, config.vlanTag, config.cpuType, overrides, { buses, guestConverted: true })
+        bootParams = bootParamsFor("converted")
         await appendLog(jobId, `Guest converted in ${result.seconds ?? 0}s${result.os ? ` (${result.os})` : ""}: VirtIO drivers installed, VMware Tools removed or scheduled for removal; the target boots from VirtIO SCSI with VirtIO NICs`, "success")
         for (const line of result.notes ?? []) await appendLog(jobId, line.msg, line.level)
       } else {
         const notApplied = conversionNotAppliedMessage(result)
         await appendLog(jobId, notApplied.msg, notApplied.level)
-        // #1173: the review step's VirtIO choices were made for a converted
-        // guest. A Windows left without the drivers would not see those disks
-        // and NICs: they go back to the hardware it has drivers for.
-        if (isWindows) {
-          const inbox = withoutVirtioChoices(overrides, buses)
-          const fallback = mapEsxiToPveConfig(vmConfig, targetVmid, config.targetStorage, config.networkBridge, config.vlanTag, config.cpuType, inbox.overrides, { buses: inbox.buses })
-          const changes = describeHardwareChanges(pveParams, fallback)
-          if (changes.length > 0) {
-            bootParams = fallback
-            await appendLog(jobId, `The VirtIO hardware chosen for this guest needs the drivers the conversion did not install, so it is replaced by hardware Windows has drivers for: ${changes.join(", ")}`, "warn")
-          }
+        const fallback = bootParamsFor("failed")
+        if (fallback !== pveParams) {
+          bootParams = fallback
+          await appendLog(jobId, `The VirtIO hardware chosen for this guest needs the drivers the conversion did not install, so it is replaced by hardware Windows has drivers for: ${describeHardwareChanges(pveParams, fallback).join(", ")}`, "warn")
         }
       }
     } else {
@@ -910,11 +982,7 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
       startAfterMigration: config.startAfterMigration, convertDisksToQcow2: config.convertDisksToQcow2 === true,
       targetStorage: config.targetStorage,
       ...(bootParams !== pveParams && { nets: bootParams.nets }),
-      // ui#1331: the operator's choice for each disk, else the job profile,
-      // else discard on a thin storage and iothread where the bus supports it.
-      driveOpts: (i, slot) => diskDriveOptions({
-        slot, storageType: storageTypes.get(diskPlan.kept[i].storage), scsihw: bootParams.scsihw, profile: config.diskOptions, disk: diskPlan.kept[i].options,
-      }),
+      driveOpts: driveOptsFor(bootParams),
     })
 
     // The source is powered off for good: give it back CBT the way we found it.
@@ -930,11 +998,13 @@ export async function runWarmMigration(jobId: string, config: WarmMigrationConfi
     await updateJob(jobId, isCancelled(jobId) ? "cancelled" : "failed", { error: String(err?.message || err) }).catch(() => {})
     await appendLog(jobId, `Warm migration failed: ${err?.message || err}`, "error").catch(() => {})
     // Best-effort cleanup: stop readers, remove OUR snapshots (specific MOR), free orphan volumes.
+    // An operator who cancelled may have asked to remove the copy on the target too.
+    const removeCopies = cancelRemovesTarget(jobId)
     await cleanupOnFailure(jobId, config, soapSession, ourSnapshots, allocatedVolumes, activeReaders, nodeIp).catch(() => {})
     // After the volumes: the VM goes only when it holds no completed copy (#612),
     // and CBT only once our snapshots are gone, which vSphere requires.
     if (createdVmid != null && pveConn) {
-      await removeTargetVmOnFailure({ jobId, pveConn, node: config.targetNode, vmid: createdVmid, allocatedVolumes })
+      await removeTargetVmOnFailure({ jobId, pveConn, node: config.targetNode, vmid: createdVmid, allocatedVolumes, removeCopies })
     }
     await restoreSourceCbt(jobId, soapSession, config.sourceVmId, cbtEnabledByUs)
     throw err
@@ -1069,26 +1139,12 @@ async function cleanupOnFailure(
       msg => appendLog(jobId, msg, "warn")).catch(() => {})
     await consolidateSourceAfterFailure(session, config.sourceVmId, (msg, level) => appendLog(jobId, msg, level))
   }
-  // Unmap every RBD volume (a kept one too), then free the volumes the VM never referenced (orphans). volumesToFree also
-  // covers a volume created by an allocation that reported a failure, and skips the
-  // slots whose allocation never started.
-  await unmapTargetVolumes(config.targetConnectionId, nodeIp, allocatedVolumes)
-  for (const v of volumesToFree(allocatedVolumes)) {
-    // A `saferemove` LVM storage zeroes the volume before removing it, which takes
-    // far longer than the 30 s executeSSH default.
-    if (nodeIp) await executeSSH(config.targetConnectionId, nodeIp, `pvesm free ${shellEscape(v.volumeId)} 2>/dev/null`, PVESM_FREE_TIMEOUT_MS).catch(() => {})
-  }
-  // Volumes holding a completed copy are deliberately NOT freed: the copy is
-  // bootable and worth hours of transfer, and deleting it on a post-copy failure
-  // is what destroyed 3.4 TB on a customer cluster (#612). Say so in the job log,
-  // one line per volume, so nothing silently lingers on the storage.
-  for (const v of volumesToKeep(allocatedVolumes)) {
-    await appendLog(jobId, `Kept target volume ${v.volumeId}: it holds a completed copy of the source disk. Remove it manually from the storage if you do not want it.`, "warn").catch(() => {})
-  }
+  // Unmap, free the orphans, keep (or remove, on the operator's word) the completed copies (#612).
+  await releaseTargetVolumes({ jobId, connectionId: config.targetConnectionId, nodeIp, allocatedVolumes, removeCopies: cancelRemovesTarget(jobId) })
 }
 
 // Re-exports: the API routes and the unit tests keep importing these from this module.
-export { cancelWarmMigrationJob, requestWarmCutover, requestWarmForcePowerOff, gateReason, __isCutoverRequestedForTest, __isForcePowerOffRequestedForTest, __awaitOperatorCutoverForTest, __sleepUnlessCutoverForTest } from "./job-control"
+export { cancelWarmMigrationJob, requestCancelRemovesTarget, requestWarmCutover, requestWarmForcePowerOff, gateReason, __isCutoverRequestedForTest, __isForcePowerOffRequestedForTest, __awaitOperatorCutoverForTest, __sleepUnlessCutoverForTest } from "./job-control"
 export { buildThickZeroScript, ZERO_PARALLEL_CHUNKS, markVolumesCopied } from "./target-provision"
 export { scaleWarmProgress, checksumDiskWindows } from "./apply"
 export type { WarmStatus, WarmMigrationConfig } from "./types"

@@ -136,6 +136,27 @@ describe("POST /api/v1/migrations/batches", () => {
     expect(pumpBatch).toHaveBeenCalledWith("b1")
   })
 
+  // The batch's copy rate cap is shared by its jobs and changed on the batch:
+  // it lives on the batch row, not in each job's config.
+  it("keeps the copy rate cap on the batch, not in its jobs", async () => {
+    const cap = { mbps: 50 }
+    h.validate.mockImplementation(async (body: any) => {
+      const v = validated(body)
+      return { ...v, value: { ...v.value, config: { ...v.value.config, copyRateLimit: body.copyRateLimit } } }
+    })
+
+    const res = await create({ ...shared, copyRateLimit: cap, vms })
+
+    expect(res.status).toBe(200)
+    expect(h.tx.migrationBatch.create.mock.calls[0][0].data.copyRateLimit).toEqual(cap)
+    expect(h.created.every(j => !("copyRateLimit" in j.config))).toBe(true)
+  })
+
+  it("creates a batch without a cap when none is asked", async () => {
+    await create({ ...shared, vms })
+    expect(h.tx.migrationBatch.create.mock.calls[0][0].data).not.toHaveProperty("copyRateLimit")
+  })
+
   it("checks the target storage for the whole batch with each VM's disk bytes", async () => {
     await create({ ...shared, vms: [{ ...vms[0], diskBytes: 3e9 }, { ...vms[1], diskBytes: "2000" }] })
 
@@ -316,6 +337,19 @@ describe("GET /api/v1/migrations/batches/[id]", () => {
     const data = (await readJson<any>(res)).data
     expect(data).toMatchObject({ id: "b1", status: "running", counts: { running: 1 } })
     expect(data.jobs[0]).toMatchObject({ id: "j1", bytesTransferred: 5, totalBytes: null, logs: [] })
+  })
+
+  it("tells which jobs are held for a manual cutover, without sending their config", async () => {
+    h.jobs = [
+      { id: "j1", status: "delta_sync", bytesTransferred: null, totalBytes: null, logs: null, config: { cutoverMode: "manual", vddkLibdir: "/opt/vddk" } },
+      { id: "j2", status: "delta_sync", bytesTransferred: null, totalBytes: null, logs: null, config: { cutoverMode: "auto" } },
+      { id: "j3", status: "full_copy", bytesTransferred: null, totalBytes: null, logs: null, config: null },
+    ]
+
+    const data = (await readJson<any>(await callRoute(DETAIL, { params: { id: "b1" } }))).data
+
+    expect(data.jobs.map((j: any) => j.cutoverMode)).toEqual(["manual", "auto", "auto"])
+    for (const j of data.jobs) expect(j).not.toHaveProperty("config")
   })
 
   it("answers a bare 404 for a batch of another tenant", async () => {
